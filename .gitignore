@@ -1,0 +1,21 @@
+# General
+*.log
+*.pid
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets
+.env
+.env.*
+
+# Python venvs
+venv/
+.venv/
+
+# Frontend build + deps
+node_modules/
+dist/
+.vite/
+
