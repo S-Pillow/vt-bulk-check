@@ -3,21 +3,141 @@ import asyncio
 import base64
 import csv
 import io
+import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal, Tuple
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 
 logger = logging.getLogger("vt_bulk_check")
 
 router = APIRouter(prefix="/vt-bulk-check")
+
+# ----- Usage Tracking -----
+# Persistent storage for daily usage counters
+_USAGE_FILE = Path(os.environ.get("VT_USAGE_FILE", "/tmp/vt_bulk_check_usage.json"))
+_USAGE_LOCK = asyncio.Lock()
+
+# Constants
+DAILY_LOOKUPS_LIMIT = 500
+RATE_LIMIT_PER_MIN = 4
+
+# Auto-rescan guardrails
+MAX_AUTO_RESCANS_PER_RUN = 25  # Maximum stale items to auto-rescan per run
+AUTO_RESCAN_IF_OLDER_THAN_DAYS = 7  # Only auto-rescan items older than this threshold
+
+
+@dataclass
+class UsageState:
+    """Tracks daily API usage across all jobs."""
+    date_utc: str = ""  # YYYY-MM-DD in UTC
+    daily_lookups_used: int = 0
+
+
+_USAGE_STATE: Optional[UsageState] = None
+
+
+def _get_utc_date_str() -> str:
+    """Get current UTC date as YYYY-MM-DD string."""
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _load_usage_state() -> UsageState:
+    """Load usage state from persistent storage."""
+    global _USAGE_STATE
+    
+    today = _get_utc_date_str()
+    
+    if _USAGE_FILE.exists():
+        try:
+            data = json.loads(_USAGE_FILE.read_text())
+            stored_date = data.get("date_utc", "")
+            if stored_date == today:
+                _USAGE_STATE = UsageState(
+                    date_utc=today,
+                    daily_lookups_used=data.get("daily_lookups_used", 0)
+                )
+                return _USAGE_STATE
+        except Exception as e:
+            logger.warning(f"Failed to load usage state: {e}")
+    
+    # Reset for new day or on error
+    _USAGE_STATE = UsageState(date_utc=today, daily_lookups_used=0)
+    return _USAGE_STATE
+
+
+def _save_usage_state(state: UsageState) -> None:
+    """Save usage state to persistent storage."""
+    try:
+        _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _USAGE_FILE.write_text(json.dumps({
+            "date_utc": state.date_utc,
+            "daily_lookups_used": state.daily_lookups_used
+        }))
+    except Exception as e:
+        logger.warning(f"Failed to save usage state: {e}")
+
+
+async def _increment_usage(job_id: Optional[str] = None) -> None:
+    """Increment usage counters for a VT API call."""
+    global _USAGE_STATE
+    
+    async with _USAGE_LOCK:
+        today = _get_utc_date_str()
+        
+        # Load or reset state if needed
+        if _USAGE_STATE is None or _USAGE_STATE.date_utc != today:
+            _USAGE_STATE = _load_usage_state()
+        
+        # Reset if date changed since load
+        if _USAGE_STATE.date_utc != today:
+            _USAGE_STATE = UsageState(date_utc=today, daily_lookups_used=0)
+        
+        # Increment daily counter
+        _USAGE_STATE.daily_lookups_used += 1
+        _save_usage_state(_USAGE_STATE)
+        
+        logger.debug(f"Usage incremented: daily={_USAGE_STATE.daily_lookups_used}")
+    
+    # Increment job-specific counter if job_id provided
+    if job_id:
+        async with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job.lookups_used += 1
+
+
+def _get_current_usage() -> Tuple[int, str]:
+    """Get current daily usage (count, date).
+    
+    The daily counter automatically resets at 00:00 UTC when the date changes.
+    """
+    global _USAGE_STATE
+    today = _get_utc_date_str()
+    
+    # Load state if not initialized
+    if _USAGE_STATE is None:
+        _load_usage_state()
+    
+    # Check if we need to reset for a new UTC day
+    if _USAGE_STATE and _USAGE_STATE.date_utc != today:
+        # Date has changed - reset the counter for the new UTC day
+        _USAGE_STATE = UsageState(date_utc=today, daily_lookups_used=0)
+        _save_usage_state(_USAGE_STATE)
+        logger.info(f"Daily usage counter reset for new UTC day: {today}")
+    
+    if _USAGE_STATE:
+        return _USAGE_STATE.daily_lookups_used, today
+    
+    return 0, today
 
 
 class SubmitRequest(BaseModel):
@@ -74,6 +194,8 @@ class JobState:
     item_order: List[str] = field(default_factory=list)
     results_by_normalized: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     error_message: Optional[str] = None
+    # Usage tracking for this job
+    lookups_used: int = 0
     # Auto-update (stale re-scan + refresh) progress tracking
     update_active: bool = False
     update_phase: Optional[Literal["scanning", "refreshing", "complete", "error"]] = None
@@ -105,6 +227,10 @@ _VT_LIMITER = AsyncMinIntervalLimiter(min_interval_seconds=15.0)
 _JOBS: Dict[str, JobState] = {}
 _JOBS_LOCK = asyncio.Lock()
 
+# Context variable to track current job_id for usage counting
+from contextvars import ContextVar
+_CURRENT_JOB_ID: ContextVar[Optional[str]] = ContextVar("current_job_id", default=None)
+
 
 def _format_last_scanned(ts: Optional[int]) -> Optional[str]:
     if not ts:
@@ -118,6 +244,26 @@ def _is_stale(ts: Optional[int], threshold_days: int = 5) -> bool:
         return True
     now = datetime.now(tz=timezone.utc).timestamp()
     return (now - ts) > (threshold_days * 86400)
+
+
+def _is_eligible_for_auto_rescan(ts: Optional[int]) -> bool:
+    """
+    Check if an item is eligible for auto-rescan based on the age threshold.
+    Only items older than AUTO_RESCAN_IF_OLDER_THAN_DAYS are eligible.
+    """
+    if not ts:
+        return True  # Never scanned = eligible
+    now = datetime.now(tz=timezone.utc).timestamp()
+    age_days = (now - ts) / 86400
+    return age_days > AUTO_RESCAN_IF_OLDER_THAN_DAYS
+
+
+def _get_report_age_days(ts: Optional[int]) -> Optional[float]:
+    """Get the age of a report in days."""
+    if not ts:
+        return None
+    now = datetime.now(tz=timezone.utc).timestamp()
+    return (now - ts) / 86400
 
 
 def _normalize_item(raw: str) -> Tuple[str, Literal["domain", "url"], str]:
@@ -164,6 +310,11 @@ async def _vt_request(method: str, path: str, *, data: Optional[Dict[str, Any]] 
             logger.debug(f"VT API request: {method} {url}")
             resp = await client.request(method, url, headers=headers, data=data)
             logger.debug(f"VT API response: {resp.status_code}")
+            
+            # Increment usage counters for every VT API call (regardless of status)
+            job_id = _CURRENT_JOB_ID.get()
+            await _increment_usage(job_id)
+            
             return resp
     except Exception as e:
         logger.error(f"VT API request failed: {method} {url} - {type(e).__name__}: {str(e)}")
@@ -297,6 +448,9 @@ async def _process_job(job_id: str) -> None:
 
     logger.info(f"Starting job processing: {job_id} with {job.total} items")
     
+    # Set context for usage tracking
+    _CURRENT_JOB_ID.set(job_id)
+    
     try:
         for normalized in job.item_order:
             async with _JOBS_LOCK:
@@ -362,12 +516,24 @@ def _job_results_list(job: JobState) -> List[Dict[str, Any]]:
     return out
 
 
-async def _auto_update_stale_job(job_id: str) -> None:
+async def _auto_update_stale_job(job_id: str, max_rescans: int = MAX_AUTO_RESCANS_PER_RUN) -> None:
     """
-    Background task that ensures stale items are fully updated:
-    1) Request a new scan (reanalyze) for each stale item
-    2) Repeatedly refresh reports until VT returns a newer last_analysis_date than baseline
+    FIRE-AND-FORGET auto-rescan for stale items.
+    
+    This function:
+    1) Requests a new scan (reanalyze) for eligible stale items only
+    2) Does NOT auto-refresh reports afterward
+    3) Does NOT poll VirusTotal for updated results
+    
+    Users must manually click "Refresh report" to see updated results.
+    
+    Guardrails:
+    - Only rescans items older than AUTO_RESCAN_IF_OLDER_THAN_DAYS
+    - Caps rescans at max_rescans (default MAX_AUTO_RESCANS_PER_RUN)
     """
+    # Set context for usage tracking
+    _CURRENT_JOB_ID.set(job_id)
+    
     async with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         if not job:
@@ -375,22 +541,39 @@ async def _auto_update_stale_job(job_id: str) -> None:
         if job.update_active:
             return
 
-        targets = [k for k in job.item_order if job.results_by_normalized.get(k, {}).get("is_stale")]
-        # If the job is currently "done", temporarily flip it back to "running" while we
-        # re-scan and refresh stale items. This prevents clients that stop polling on
-        # status=="done" from missing the update phases.
-        if targets and job.status == "done":
-            job.status = "running"
+        # Find stale items that are ELIGIBLE for auto-rescan (older than threshold)
+        all_stale = [k for k in job.item_order if job.results_by_normalized.get(k, {}).get("is_stale")]
+        eligible = []
+        for k in all_stale:
+            r = job.results_by_normalized.get(k, {})
+            last_ts = r.get("last_analysis_date")
+            if _is_eligible_for_auto_rescan(last_ts):
+                eligible.append(k)
+        
+        # Apply the cap
+        targets = eligible[:max_rescans]
+        skipped_count = len(eligible) - len(targets)
+        total_stale = len(all_stale)
+        ineligible_count = total_stale - len(eligible)
+        
+        logger.info(
+            f"Auto-rescan job {job_id}: {total_stale} stale, {len(eligible)} eligible "
+            f"(older than {AUTO_RESCAN_IF_OLDER_THAN_DAYS} days), {len(targets)} will be rescanned "
+            f"(cap={max_rescans}), {skipped_count} skipped due to cap, {ineligible_count} too recent"
+        )
+        
         job.update_active = True
         job.update_phase = "scanning"
         job.update_total = len(targets)
         job.update_done = 0
-        job.update_message = f"Rescanning stale items… 0/{len(targets)}" if targets else "Complete"
         job.update_started_at = time.monotonic()
         job.update_error = None
-        job.update_baseline_by_normalized = {
-            k: (job.results_by_normalized.get(k, {}) or {}).get("last_analysis_date") for k in targets
-        }
+        job.update_baseline_by_normalized = {}
+        
+        if targets:
+            job.update_message = f"Requesting rescans… 0/{len(targets)}"
+        else:
+            job.update_message = "No eligible items to rescan"
 
     if not targets:
         async with _JOBS_LOCK:
@@ -400,15 +583,21 @@ async def _auto_update_stale_job(job_id: str) -> None:
                 job.update_phase = "complete"
                 job.update_total = 0
                 job.update_done = 0
-                job.update_message = "Complete"
+                if ineligible_count > 0:
+                    job.update_message = f"No items old enough to auto-rescan ({ineligible_count} stale but < {AUTO_RESCAN_IF_OLDER_THAN_DAYS} days old)"
+                else:
+                    job.update_message = "No stale items"
                 job.update_error = None
-                job.update_baseline_by_normalized = {}
                 if job.status != "error":
                     job.status = "done"
+        logger.info(f"Auto-rescan job {job_id}: No eligible items, completed immediately")
         return
 
-    # Phase 1: request re-analyze
+    # FIRE-AND-FORGET: Request re-analyze for each eligible item (NO refresh polling afterward)
     scan_done = 0
+    scan_success = 0
+    scan_failed = 0
+    
     for normalized in targets:
         async with _JOBS_LOCK:
             job2 = _JOBS.get(job_id)
@@ -423,19 +612,28 @@ async def _auto_update_stale_job(job_id: str) -> None:
                 await _reanalyze_domain(normalized)
             else:
                 await _reanalyze_url(full_url or normalized)
+            
+            scan_success += 1
             async with _JOBS_LOCK:
                 job3 = _JOBS.get(job_id)
                 if not job3:
                     return
                 if normalized in job3.results_by_normalized:
                     job3.results_by_normalized[normalized]["scan_requested"] = True
+            
+            logger.debug(f"Auto-rescan: Requested rescan for {item_type} '{normalized}'")
+            
         except Exception as e:
+            scan_failed += 1
             async with _JOBS_LOCK:
                 job3 = _JOBS.get(job_id)
                 if not job3:
                     return
                 if normalized in job3.results_by_normalized:
                     job3.results_by_normalized[normalized]["error"] = str(e)
+            
+            logger.warning(f"Auto-rescan: Failed to request rescan for '{normalized}': {e}")
+            
         finally:
             scan_done += 1
             async with _JOBS_LOCK:
@@ -443,104 +641,35 @@ async def _auto_update_stale_job(job_id: str) -> None:
                 if not job3:
                     return
                 job3.update_done = scan_done
-                job3.update_message = f"Rescanning stale items… {scan_done}/{job3.update_total}"
+                job3.update_message = f"Requesting rescans… {scan_done}/{job3.update_total}"
 
-    # Phase 2: refresh until updated
+    # COMPLETE - No refresh polling, fire-and-forget only
     async with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         if not job:
             return
-        job.update_phase = "refreshing"
-        job.update_done = 0
-        job.update_message = f"Refreshing reports… 0/{job.update_total} updated"
-
-    # We'll wait up to ~30 minutes for fresh reports to land.
-    deadline = time.monotonic() + (30 * 60)
-    updated: set[str] = set()
-
-    while time.monotonic() < deadline:
-        # Early exit if job was deleted
-        async with _JOBS_LOCK:
-            job = _JOBS.get(job_id)
-            if not job:
-                return
-            baselines = dict(job.update_baseline_by_normalized)
-            current_total = job.update_total
-
-        # Refresh items not yet updated
-        for normalized in targets:
-            if normalized in updated:
-                continue
-
-            async with _JOBS_LOCK:
-                job2 = _JOBS.get(job_id)
-                if not job2:
-                    return
-                r = job2.results_by_normalized.get(normalized) or {}
-                item_type = r.get("type")
-                input_value = r.get("input", normalized)
-                full_url = r.get("normalized_full_url")
-
-            try:
-                if item_type == "domain":
-                    report = await _fetch_domain_report(normalized)
-                else:
-                    report = await _fetch_url_report(full_url or normalized)
-
-                refreshed = _parse_analysis_from_report(input_value, normalized, item_type, report)
-                if item_type == "url":
-                    refreshed["normalized_full_url"] = full_url
-
-                # Determine if this is a "new" analysis vs baseline (or at least no longer stale)
-                baseline_ts = baselines.get(normalized)
-                new_ts = refreshed.get("last_analysis_date")
-                is_newer = False
-                if baseline_ts is None and new_ts is not None:
-                    is_newer = True
-                elif baseline_ts is not None and new_ts is not None and int(new_ts) > int(baseline_ts):
-                    is_newer = True
-                is_fresh = not bool(refreshed.get("is_stale"))
-
-                async with _JOBS_LOCK:
-                    job3 = _JOBS.get(job_id)
-                    if not job3:
-                        return
-                    job3.results_by_normalized[normalized] = refreshed
-                    if is_newer or is_fresh:
-                        updated.add(normalized)
-                        job3.update_done = len(updated)
-                        job3.update_message = f"Refreshing reports… {job3.update_done}/{current_total} updated"
-            except Exception as e:
-                async with _JOBS_LOCK:
-                    job3 = _JOBS.get(job_id)
-                    if not job3:
-                        return
-                    if normalized in job3.results_by_normalized:
-                        job3.results_by_normalized[normalized]["error"] = str(e)
-
-        if len(updated) >= len(targets):
-            break
-
-        # Avoid tight loops; VT updates can take a bit.
-        await asyncio.sleep(5.0)
-
-    async with _JOBS_LOCK:
-        job = _JOBS.get(job_id)
-        if not job:
-            return
-        if len(updated) >= len(targets):
-            job.update_phase = "complete"
-            job.update_message = "Complete"
-            # Restore job to done once all refreshed results are applied
-            if job.status != "error":
-                job.status = "done"
-        else:
-            job.update_phase = "error"
-            job.update_error = "Timed out waiting for refreshed reports"
-            job.update_message = f"Refreshing reports… {len(updated)}/{len(targets)} updated (timed out)"
-            job.status = "error"
-            job.error_message = job.update_error
+        
+        job.update_phase = "complete"
         job.update_active = False
+        
+        # Build completion message
+        msg_parts = [f"Requested {scan_success} rescan(s)"]
+        if scan_failed > 0:
+            msg_parts.append(f"{scan_failed} failed")
+        if skipped_count > 0:
+            msg_parts.append(f"{skipped_count} skipped (cap reached)")
+        msg_parts.append("Refresh reports manually to see results")
+        
+        job.update_message = ". ".join(msg_parts) + "."
+        
+        if job.status != "error":
+            job.status = "done"
+    
+    logger.info(
+        f"Auto-rescan job {job_id} COMPLETE (fire-and-forget): "
+        f"{scan_success} rescans requested, {scan_failed} failed, {skipped_count} skipped. "
+        f"NO follow-up VT calls scheduled."
+    )
 
 @router.post("/submit")
 async def submit(req: SubmitRequest):
@@ -649,8 +778,94 @@ async def export_job_csv(job_id: str):
     )
 
 
+@router.get("/usage")
+async def get_usage(job_id: Optional[str] = Query(None, alias="jobId")):
+    """
+    Get API usage statistics without making any VirusTotal API calls.
+    
+    Returns:
+        - jobLookupsUsed: Number of lookups used by the specified job (if job_id provided)
+        - dailyLookupsUsed: Total lookups used today (UTC)
+        - dailyLookupsLimit: Daily limit (500)
+        - rateLimitPerMin: Rate limit per minute (4)
+    """
+    job_lookups = 0
+    
+    if job_id:
+        async with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            if job:
+                job_lookups = job.lookups_used
+    
+    daily_used, _ = _get_current_usage()
+    
+    return {
+        "jobLookupsUsed": job_lookups,
+        "dailyLookupsUsed": daily_used,
+        "dailyLookupsLimit": DAILY_LOOKUPS_LIMIT,
+        "rateLimitPerMin": RATE_LIMIT_PER_MIN,
+    }
+
+
+@router.get("/jobs/{job_id}/rescan-eligibility")
+async def get_rescan_eligibility(job_id: str):
+    """
+    Get information about how many items are eligible for auto-rescan.
+    Used by the frontend to show confirmation dialogs before triggering rescans.
+    
+    Does NOT make any VirusTotal API calls.
+    """
+    async with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        all_stale = []
+        eligible = []
+        
+        for k in job.item_order:
+            r = job.results_by_normalized.get(k, {})
+            if r.get("is_stale"):
+                all_stale.append(k)
+                last_ts = r.get("last_analysis_date")
+                age_days = _get_report_age_days(last_ts)
+                if _is_eligible_for_auto_rescan(last_ts):
+                    eligible.append({
+                        "normalized": k,
+                        "age_days": round(age_days, 1) if age_days else None
+                    })
+        
+        will_rescan = min(len(eligible), MAX_AUTO_RESCANS_PER_RUN)
+        skipped_due_to_cap = max(0, len(eligible) - MAX_AUTO_RESCANS_PER_RUN)
+        too_recent = len(all_stale) - len(eligible)
+        
+        daily_used, _ = _get_current_usage()
+        daily_remaining = max(0, DAILY_LOOKUPS_LIMIT - daily_used)
+        
+        return {
+            "totalStale": len(all_stale),
+            "eligibleCount": len(eligible),
+            "willRescan": will_rescan,
+            "skippedDueToCap": skipped_due_to_cap,
+            "tooRecent": too_recent,
+            "maxAutoRescansPerRun": MAX_AUTO_RESCANS_PER_RUN,
+            "autoRescanThresholdDays": AUTO_RESCAN_IF_OLDER_THAN_DAYS,
+            "dailyLookupsRemaining": daily_remaining,
+            "dailyLookupsLimit": DAILY_LOOKUPS_LIMIT,
+        }
+
+
 @router.post("/jobs/{job_id}/auto-update-stale")
 async def auto_update_stale(job_id: str, _req: AutoUpdateStaleRequest):
+    """
+    Trigger fire-and-forget auto-rescan for eligible stale items.
+    
+    This endpoint:
+    - Only rescans items older than AUTO_RESCAN_IF_OLDER_THAN_DAYS
+    - Caps rescans at MAX_AUTO_RESCANS_PER_RUN
+    - Does NOT auto-refresh reports afterward (fire-and-forget)
+    - Does NOT poll VirusTotal for updates
+    """
     # Keep job_id both in path and body to make clients explicit
     if _req.job_id != job_id:
         raise HTTPException(status_code=400, detail="job_id mismatch")
@@ -660,23 +875,58 @@ async def auto_update_stale(job_id: str, _req: AutoUpdateStaleRequest):
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         if job.update_active:
-            return {"scheduled": False, "message": "Auto-update already in progress"}
-        stale_targets = [k for k in job.item_order if job.results_by_normalized.get(k, {}).get("is_stale")]
-        if not stale_targets:
-            # Nothing to do; keep job stable and mark update as complete/no-op.
+            return {"scheduled": False, "message": "Auto-rescan already in progress"}
+        
+        # Check for stale items
+        all_stale = [k for k in job.item_order if job.results_by_normalized.get(k, {}).get("is_stale")]
+        
+        if not all_stale:
             job.update_active = False
             job.update_phase = "complete"
             job.update_total = 0
             job.update_done = 0
-            job.update_message = "Complete"
+            job.update_message = "No stale items"
             job.update_error = None
             job.update_baseline_by_normalized = {}
             if job.status != "error":
                 job.status = "done"
             return {"scheduled": False, "message": "No stale items"}
+        
+        # Check for eligible items (older than threshold)
+        eligible = []
+        for k in all_stale:
+            r = job.results_by_normalized.get(k, {})
+            last_ts = r.get("last_analysis_date")
+            if _is_eligible_for_auto_rescan(last_ts):
+                eligible.append(k)
+        
+        if not eligible:
+            job.update_active = False
+            job.update_phase = "complete"
+            job.update_total = 0
+            job.update_done = 0
+            job.update_message = f"No items old enough to auto-rescan ({len(all_stale)} stale but < {AUTO_RESCAN_IF_OLDER_THAN_DAYS} days old)"
+            job.update_error = None
+            job.update_baseline_by_normalized = {}
+            if job.status != "error":
+                job.status = "done"
+            return {
+                "scheduled": False, 
+                "message": f"No items eligible for auto-rescan (all {len(all_stale)} stale items are less than {AUTO_RESCAN_IF_OLDER_THAN_DAYS} days old)"
+            }
+        
+        will_rescan = min(len(eligible), MAX_AUTO_RESCANS_PER_RUN)
+        skipped = len(eligible) - will_rescan
 
     asyncio.create_task(_auto_update_stale_job(job_id))
-    return {"scheduled": True}
+    
+    return {
+        "scheduled": True,
+        "willRescan": will_rescan,
+        "skippedDueToCap": skipped,
+        "maxAutoRescansPerRun": MAX_AUTO_RESCANS_PER_RUN,
+        "message": f"Requesting rescans for {will_rescan} eligible item(s)" + (f" ({skipped} skipped due to cap)" if skipped > 0 else "")
+    }
 
 
 @router.post("/refresh")
@@ -694,6 +944,9 @@ async def refresh(req: RefreshRequest):
         if not existing:
             raise HTTPException(status_code=404, detail="Item not found in job")
         input_value = existing.get("input", req.item)
+
+    # Set context for usage tracking
+    _CURRENT_JOB_ID.set(req.job_id)
 
     if item_type == "domain":
         report = await _fetch_domain_report(normalized)
@@ -728,6 +981,9 @@ async def force_scan(req: ForceScanRequest):
         if not existing:
             raise HTTPException(status_code=404, detail="Item not found in job")
 
+    # Set context for usage tracking
+    _CURRENT_JOB_ID.set(req.job_id)
+
     if req.type == "domain":
         await _reanalyze_domain(normalized)
     else:
@@ -753,6 +1009,8 @@ async def refresh_stale(req: JobOnlyRequest):
         targets = [k for k in job.item_order if job.results_by_normalized.get(k, {}).get("is_stale")]
 
     async def _run() -> None:
+        # Set context for usage tracking
+        _CURRENT_JOB_ID.set(req.job_id)
         for normalized in targets:
             async with _JOBS_LOCK:
                 job2 = _JOBS.get(req.job_id)
@@ -802,6 +1060,9 @@ async def force_scan_stale(req: JobOnlyRequest):
         targets = [k for k in job.item_order if job.results_by_normalized.get(k, {}).get("is_stale")]
 
     async def _run() -> None:
+        # Set context for usage tracking
+        _CURRENT_JOB_ID.set(req.job_id)
+        
         for normalized in targets:
             async with _JOBS_LOCK:
                 job2 = _JOBS.get(req.job_id)
@@ -860,6 +1121,9 @@ async def force_scan_bulk(req: ForceScanBulkRequest):
                 skipped.append(n)
 
     async def _run() -> None:
+        # Set context for usage tracking
+        _CURRENT_JOB_ID.set(req.job_id)
+        
         for normalized in targets:
             async with _JOBS_LOCK:
                 job2 = _JOBS.get(req.job_id)

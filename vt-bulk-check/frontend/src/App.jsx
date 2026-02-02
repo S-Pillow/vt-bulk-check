@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft, Shield, RotateCcw, RefreshCcw, Zap, X, Sun, Moon } from 'lucide-react'
+import { ArrowLeft, Shield, RotateCcw, RefreshCcw, Zap, X, Sun, Moon, Info, AlertTriangle, ChevronDown, ChevronUp } from 'lucide-react'
 
 function splitInputs(raw) {
   const parts = (raw || '')
@@ -39,12 +39,22 @@ export default function App() {
   const [selected, setSelected] = useState(null)
   const [rowBusy, setRowBusy] = useState({})
   const [exporting, setExporting] = useState(false)
-  const [autoForceScanStaleEnabled, setAutoForceScanStaleEnabled] = useState(true)
+  const [autoForceScanStaleEnabled, setAutoForceScanStaleEnabled] = useState(false) // OFF by default for quota safety
   const [autoScanError, setAutoScanError] = useState(null)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [confirmModal, setConfirmModal] = useState(null) // { willRescan, dailyRemaining, onConfirm }
+  const [rescanEligibility, setRescanEligibility] = useState(null)
   const [bulkBusy, setBulkBusy] = useState(false)
   const [selectedNormalized, setSelectedNormalized] = useState(() => new Set())
   const [theme, setTheme] = useState('dark')
+  const [usage, setUsage] = useState({
+    jobLookupsUsed: 0,
+    dailyLookupsUsed: 0,
+    dailyLookupsLimit: 500,
+    rateLimitPerMin: 4
+  })
   const pollRef = useRef(null)
+  const usagePollRef = useRef(null)
   const autoTriggeredForJobIdRef = useRef(null)
 
   const total = job?.total ?? 0
@@ -81,12 +91,75 @@ export default function App() {
     window.localStorage.setItem('vt-bulk-check-theme', theme)
   }, [theme])
 
+  // Poll usage endpoint when job is running
+  useEffect(() => {
+    // Initial fetch even without job
+    fetchUsage(jobId).then(setUsage).catch(() => {})
+
+    if (!jobId) return
+
+    let cancelled = false
+
+    async function tick() {
+      if (cancelled) return
+      try {
+        const data = await fetchUsage(jobId)
+        if (!cancelled) setUsage(data)
+      } catch (e) {
+        // Silently ignore usage fetch errors
+      }
+    }
+
+    // Poll every 3 seconds while job is running
+    const shouldPoll = job?.status === 'running' || job?.update?.active
+    if (shouldPoll) {
+      usagePollRef.current = setInterval(tick, 3000)
+    } else {
+      // One final fetch when job completes
+      tick()
+    }
+
+    return () => {
+      cancelled = true
+      if (usagePollRef.current) {
+        clearInterval(usagePollRef.current)
+        usagePollRef.current = null
+      }
+    }
+  }, [jobId, job?.status, job?.update?.active])
+
   async function fetchJob(id) {
     // Avoid any intermediary caching while we rely on polling for UI truth.
     const resp = await fetch(`/api/vt-bulk-check/jobs/${id}?t=${Date.now()}`, { cache: 'no-store' })
     if (!resp.ok) throw new Error(await resp.text())
     return resp.json()
   }
+
+  async function fetchUsage(jobIdParam) {
+    const url = jobIdParam
+      ? `/api/vt-bulk-check/usage?jobId=${encodeURIComponent(jobIdParam)}&t=${Date.now()}`
+      : `/api/vt-bulk-check/usage?t=${Date.now()}`
+    const resp = await fetch(url, { cache: 'no-store' })
+    if (!resp.ok) throw new Error(await resp.text())
+    return resp.json()
+  }
+
+  // Calculate daily usage percentage and warnings
+  const dailyUsagePercent = usage.dailyLookupsLimit > 0
+    ? (usage.dailyLookupsUsed / usage.dailyLookupsLimit) * 100
+    : 0
+  const dailyUsageWarning = dailyUsagePercent >= 95
+    ? 'Almost out of lookups for today.'
+    : dailyUsagePercent >= 80
+      ? 'Approaching today\'s limit.'
+      : null
+
+  // Calculate estimated lookups before running
+  const estimatedLookups = useMemo(() => {
+    const items = splitInputs(rawInput)
+    const unique = new Set(items.map(s => s.trim().toLowerCase()))
+    return unique.size
+  }, [rawInput])
 
   async function downloadCsv() {
     if (!jobId || exporting) return
@@ -111,9 +184,44 @@ export default function App() {
     }
   }
 
-  async function autoUpdateStaleNow() {
+  async function fetchRescanEligibility() {
+    if (!jobId) return null
+    try {
+      const resp = await fetch(`/api/vt-bulk-check/jobs/${jobId}/rescan-eligibility`)
+      if (!resp.ok) return null
+      return resp.json()
+    } catch (e) {
+      return null
+    }
+  }
+
+  async function autoUpdateStaleNow(skipConfirm = false) {
     if (!jobId) return
     setAutoScanError(null)
+    
+    // Check eligibility first to show confirmation if needed
+    if (!skipConfirm) {
+      const eligibility = await fetchRescanEligibility()
+      if (eligibility) {
+        setRescanEligibility(eligibility)
+        const { willRescan, dailyLookupsRemaining, maxAutoRescansPerRun } = eligibility
+        
+        // Show confirmation if willRescan > 25 OR if daily remaining is low
+        if (willRescan > 0 && (willRescan >= maxAutoRescansPerRun || dailyLookupsRemaining < willRescan * 2)) {
+          setConfirmModal({
+            willRescan,
+            dailyRemaining: dailyLookupsRemaining,
+            eligibility,
+            onConfirm: () => {
+              setConfirmModal(null)
+              autoUpdateStaleNow(true) // Skip confirm on retry
+            }
+          })
+          return
+        }
+      }
+    }
+    
     try {
       const resp = await fetch(`/api/vt-bulk-check/jobs/${jobId}/auto-update-stale`, {
         method: 'POST',
@@ -121,6 +229,10 @@ export default function App() {
         body: JSON.stringify({ job_id: jobId })
       })
       if (!resp.ok) throw new Error(await resp.text())
+      const data = await resp.json()
+      if (!data.scheduled && data.message) {
+        setAutoScanError(data.message)
+      }
     } catch (e) {
       setAutoScanError(String(e?.message || e))
     }
@@ -162,7 +274,8 @@ export default function App() {
         const uIsComplete = !uActive && (uPhase === 'complete' || uPhase === 'error')
         const staleNow = (data?.results || []).filter((r) => r?.is_stale).length
 
-        // Single authoritative trigger: when job is done and stale exists, kick off auto-update.
+        // Auto-trigger: when job is done and stale exists, kick off auto-rescan (with confirmation)
+        // This is fire-and-forget - no additional polling needed after rescans are requested
         if (
           data?.status === 'done' &&
           autoForceScanStaleEnabled &&
@@ -172,14 +285,15 @@ export default function App() {
           autoTriggeredForJobIdRef.current !== jobId
         ) {
           autoTriggeredForJobIdRef.current = jobId
-          autoUpdateStaleNow()
+          autoUpdateStaleNow() // Will show confirmation modal if needed
         }
 
+        // Keep polling while job is running or update is active
+        // NO longer need to poll indefinitely for stale items (fire-and-forget)
         const shouldKeepPolling =
           data?.status === 'running' ||
           uActive ||
-          (uPhase != null && !uIsComplete) ||
-          (autoForceScanStaleEnabled && staleNow > 0)
+          (uPhase != null && !uIsComplete)
 
         if (data.status === 'error' || (data.status === 'done' && !shouldKeepPolling)) {
           if (pollRef.current) {
@@ -330,6 +444,27 @@ export default function App() {
             onChange={(e) => setRawInput(e.target.value)}
             placeholder={`example.biz\nhttps://example.biz/path\nexample.biz/path`}
           />
+          {estimatedLookups > 0 && (
+            <div className="estimatedLookups" style={{ marginTop: 8, marginBottom: 4 }}>
+              <span
+                className="muted"
+                title="Estimate is based on unique items entered. Extra actions like 'Request new scan' and 'Refresh report' use additional lookups."
+              >
+                Estimated lookups: {estimatedLookups}
+                <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
+              </span>
+              {autoForceScanStaleEnabled && (
+                <span
+                  className="muted"
+                  style={{ marginLeft: 8 }}
+                  title="Stale items are determined after the first lookup. This is a maximum estimate."
+                >
+                  + up to {estimatedLookups} additional lookups (stale rescans)
+                  <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
+                </span>
+              )}
+            </div>
+          )}
           <div style={{ height: 12 }} />
           <div className="row">
             <button className="btn btnPrimary" onClick={onSubmit} disabled={submitting}>
@@ -358,10 +493,53 @@ export default function App() {
         <div className="card cardAccent">
           <div className="label">API Limits</div>
           <div className="limits">
-            <div>Request rate 4 lookups / min</div>
-            <div>Daily quota 500 lookups / day</div>
-            <div>Monthly quota 15.5 K lookups / month</div>
+            <div>Rate limit: {usage.rateLimitPerMin} / min</div>
+            <div>Daily quota: {usage.dailyLookupsLimit} lookups / day</div>
+            <div>Monthly quota: 15.5 K lookups / month</div>
           </div>
+
+          <div style={{ height: 14 }} />
+          <div className="label">Usage</div>
+          
+          {/* Lookups this run */}
+          <div className="usageRow" style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <span
+              className="muted"
+              title="Counts VirusTotal requests made by this tool during the current run."
+              style={{ cursor: 'help' }}
+            >
+              Lookups this run: <strong>{usage.jobLookupsUsed}</strong>
+              <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
+            </span>
+          </div>
+          
+          {/* Daily usage with progress bar */}
+          <div className="usageRow" style={{ marginBottom: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <span
+                className="muted"
+                title="Your VirusTotal daily allowance resets at 00:00 UTC."
+                style={{ cursor: 'help' }}
+              >
+                Daily usage: <strong>{usage.dailyLookupsUsed} / {usage.dailyLookupsLimit}</strong> ({Math.round(dailyUsagePercent)}%)
+                <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
+              </span>
+            </div>
+            <div className="progress" style={{ marginTop: 4 }}>
+              <div
+                className={`progressbar ${dailyUsagePercent >= 95 ? 'danger' : dailyUsagePercent >= 80 ? 'warning' : ''}`}
+                aria-label="daily usage"
+              >
+                <div style={{ width: `${Math.min(100, dailyUsagePercent)}%` }} />
+              </div>
+            </div>
+            {dailyUsageWarning && (
+              <div className={`usageWarning ${dailyUsagePercent >= 95 ? 'danger' : 'warning'}`} style={{ marginTop: 6, fontSize: '0.85em' }}>
+                {dailyUsageWarning}
+              </div>
+            )}
+          </div>
+
           <div style={{ height: 14 }} />
           <div className="label">Progress</div>
           <div className="progress">
@@ -377,19 +555,63 @@ export default function App() {
             Status: <span style={{ fontWeight: 800 }}>{progressPhaseLabel}</span>
             {updateActive && update?.message ? <span> · {update.message}</span> : null}
           </div>
-          <div className="row" style={{ justifyContent: 'space-between', gap: 10 }}>
-            <label className="muted" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <input
-                type="checkbox"
-                checked={autoForceScanStaleEnabled}
-                onChange={(e) => setAutoForceScanStaleEnabled(e.target.checked)}
-              />
-              Auto request new scan for stale results
-            </label>
-            <div className="muted" style={{ whiteSpace: 'nowrap' }}>
-              Stale: {staleCount}
-            </div>
+          <div className="muted" style={{ marginBottom: 10 }}>
+            Stale items: <strong>{staleCount}</strong>
           </div>
+          
+          {/* Advanced / Quota & Freshness Section */}
+          <div style={{ borderTop: '1px solid var(--border)', paddingTop: 12, marginTop: 8 }}>
+            <button
+              className="advancedToggle"
+              onClick={() => setAdvancedOpen(!advancedOpen)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                background: 'none',
+                border: 'none',
+                color: 'var(--muted)',
+                cursor: 'pointer',
+                padding: 0,
+                fontSize: '12px',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                letterSpacing: '0.08em'
+              }}
+            >
+              {advancedOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+              Advanced / Quota & Freshness
+            </button>
+            
+            {advancedOpen && (
+              <div style={{ marginTop: 12, padding: '12px', background: 'rgba(0,0,0,0.15)', borderRadius: 8 }}>
+                <label
+                  style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}
+                  title={`Only rescans items older than 7 days. Capped at 25 rescans per run. Fire-and-forget: you must manually refresh to see updated results.`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={autoForceScanStaleEnabled}
+                    onChange={(e) => setAutoForceScanStaleEnabled(e.target.checked)}
+                    style={{ marginTop: 2 }}
+                  />
+                  <div>
+                    <span style={{ fontWeight: 700, color: 'var(--text)' }}>
+                      Auto rescan stale results
+                      <span style={{ color: 'var(--warn)', marginLeft: 6 }}>(uses extra lookups)</span>
+                    </span>
+                    <div className="muted" style={{ fontSize: '12px', marginTop: 4, lineHeight: 1.4 }}>
+                      Requests rescans now. You'll need to manually refresh reports later to see updated results.
+                    </div>
+                    <div className="muted" style={{ fontSize: '11px', marginTop: 4, opacity: 0.8 }}>
+                      Only items older than 7 days · Max 25 per run
+                    </div>
+                  </div>
+                </label>
+              </div>
+            )}
+          </div>
+          
           {autoScanError ? <div style={{ marginTop: 10 }} className="err">{autoScanError}</div> : null}
         </div>
       </div>
@@ -523,11 +745,21 @@ export default function App() {
                     <td>{r.last_scanned_display || '—'}</td>
                     <td onClick={(e) => e.stopPropagation()}>
                       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
-                        <button className="smallBtn" onClick={() => refreshOne(r.input)} disabled={!jobId}>
+                        <button
+                          className="smallBtn"
+                          onClick={() => refreshOne(r.input)}
+                          disabled={!jobId}
+                          title="Fetch the latest report (uses 1 lookup)."
+                        >
                           <RefreshCcw size={14} className={rowBusy[`refresh:${r.input}`] ? 'iconSpin' : undefined} />
                           Refresh report
                         </button>
-                        <button className="smallBtn primary" onClick={() => forceScanOne(r.input, r.type)} disabled={!jobId}>
+                        <button
+                          className="smallBtn primary"
+                          onClick={() => forceScanOne(r.input, r.type)}
+                          disabled={!jobId}
+                          title="Request a new scan (uses 1 lookup). Results may take a few minutes."
+                        >
                           <RotateCcw size={14} className={rowBusy[`scan:${r.input}`] ? 'iconSpin' : undefined} />
                           Request new scan
                         </button>
@@ -610,13 +842,67 @@ export default function App() {
             {details.scan_requested ? <div className="muted">Scan requested</div> : null}
             {details.error ? <div className="err" style={{ marginTop: 8 }}>{details.error}</div> : null}
             <div style={{ height: 12 }} />
-            <button className="smallBtn" onClick={() => refreshOne(details.input)} disabled={!jobId}>
+            <button
+              className="smallBtn"
+              onClick={() => refreshOne(details.input)}
+              disabled={!jobId}
+              title="Fetch the latest report (uses 1 lookup)."
+            >
               <RefreshCcw size={14} className={rowBusy[`refresh:${details.input}`] ? 'iconSpin' : undefined} />
               Refresh report
             </button>
           </div>
         </>
       ) : null}
+
+      {/* Confirmation Modal for Auto-Rescan */}
+      {confirmModal && (
+        <>
+          <div className="drawerBackdrop" onClick={() => setConfirmModal(null)} />
+          <div className="confirmModal">
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+              <AlertTriangle size={24} style={{ color: 'var(--warn)' }} />
+              <div className="label" style={{ margin: 0, fontSize: 14 }}>Confirm Auto-Rescan</div>
+            </div>
+            
+            <div style={{ marginBottom: 16 }}>
+              <p style={{ margin: '0 0 12px 0' }}>
+                This will use up to <strong style={{ color: 'var(--warn)' }}>{confirmModal.willRescan} additional lookup(s)</strong> now.
+              </p>
+              
+              {confirmModal.eligibility && (
+                <div className="muted" style={{ fontSize: 13, lineHeight: 1.5 }}>
+                  <div>• {confirmModal.eligibility.totalStale} stale items total</div>
+                  <div>• {confirmModal.eligibility.eligibleCount} eligible (older than {confirmModal.eligibility.autoRescanThresholdDays} days)</div>
+                  <div>• {confirmModal.willRescan} will be rescanned (max {confirmModal.eligibility.maxAutoRescansPerRun} per run)</div>
+                  {confirmModal.eligibility.skippedDueToCap > 0 && (
+                    <div style={{ color: 'var(--warn)' }}>• {confirmModal.eligibility.skippedDueToCap} will be skipped (cap reached)</div>
+                  )}
+                </div>
+              )}
+              
+              {confirmModal.dailyRemaining < confirmModal.willRescan * 2 && (
+                <div style={{ marginTop: 12, padding: '8px 12px', background: 'rgba(239,68,68,0.15)', borderRadius: 6, color: 'var(--danger)', fontSize: 13 }}>
+                  <strong>Warning:</strong> Daily quota is low ({confirmModal.dailyRemaining} lookups remaining).
+                </div>
+              )}
+              
+              <div className="muted" style={{ marginTop: 12, fontSize: 12 }}>
+                Note: You'll need to manually click "Refresh report" on each item to see updated results.
+              </div>
+            </div>
+            
+            <div className="row" style={{ justifyContent: 'flex-end', gap: 10 }}>
+              <button className="smallBtn" onClick={() => setConfirmModal(null)}>
+                Cancel
+              </button>
+              <button className="smallBtn primary" onClick={confirmModal.onConfirm}>
+                Continue ({confirmModal.willRescan} lookups)
+              </button>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   )
 }
