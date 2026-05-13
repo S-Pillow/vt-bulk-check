@@ -764,9 +764,25 @@ async def export_job_csv(job_id: str):
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["domain", "flagging"])
+    writer.writerow(["domain", "type", "flagging", "total_engines", "detection_ratio", "last_scanned", "status", "error"])
     for r in results:
-        writer.writerow([r.get("input", ""), r.get("flagging_engines", 0)])
+        error = r.get("error") or ""
+        if error:
+            status = "ERROR"
+        elif r.get("is_stale"):
+            status = "STALE"
+        else:
+            status = "OK"
+        writer.writerow([
+            r.get("input", ""),
+            r.get("type", ""),
+            "" if error else r.get("flagging_engines", 0),
+            "" if error else r.get("total_engines", 0),
+            "" if error else r.get("detection_ratio", ""),
+            r.get("last_scanned_display") or "",
+            status,
+            error,
+        ])
 
     csv_content = buf.getvalue()
     return Response(
