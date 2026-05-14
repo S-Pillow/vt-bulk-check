@@ -64,6 +64,8 @@ export default function App() {
 
   const results = job?.results ?? []
   const staleCount = useMemo(() => results.filter((r) => r.is_stale).length, [results])
+  const errorCount = useMemo(() => results.filter((r) => r.error).length, [results])
+  const quotaErrorCount = useMemo(() => results.filter((r) => r.error && String(r.error).includes('429')).length, [results])
   const update = job?.update || null
 
   const updateActive = Boolean(update?.active)
@@ -665,6 +667,22 @@ export default function App() {
 
         <div style={{ height: 8 }} />
 
+        {/* Error summary banner */}
+        {errorCount > 0 && (
+          <div className="errorBanner">
+            <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+            <div>
+              <strong>{errorCount} lookup{errorCount !== 1 ? 's' : ''} failed</strong>
+              {quotaErrorCount > 0 && (
+                <span> — {quotaErrorCount} due to daily quota (429). These domains were <strong>not checked</strong>. Results show <strong>—</strong> not 0.</span>
+              )}
+              {quotaErrorCount === 0 && (
+                <span> — these domains were not checked. Use "Retry" on each row or re-run when the issue is resolved.</span>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="tableWrap">
           <table className="table">
             <thead>
@@ -702,7 +720,7 @@ export default function App() {
                   return (
                   <tr
                     key={`${r.type}:${r.normalized}`}
-                    className={`linkRow rowHover ${severity} ${r.is_stale ? 'isStale' : ''} ${hasError ? 'hasError' : ''}`}
+                    className={`linkRow rowHover ${hasError ? '' : severity} ${r.is_stale ? 'isStale' : ''} ${hasError ? 'hasError' : ''}`}
                     onClick={() => setSelected(r)}
                     title="Open details"
                   >
@@ -726,43 +744,64 @@ export default function App() {
                         <div className="inputMain">{r.input}</div>
                         <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
                           {r.error ? (
-                            <span className="badge badgeBad" title={r.error}>ERROR</span>
+                            <span className="badge badgeBad">NOT CHECKED</span>
                           ) : (
                             <span className={`badge ${severity === 'bad' ? 'badgeBad' : severity === 'warn' ? 'badgeWarn' : 'badgeOk'}`}>
                               {severity === 'bad' ? 'MALICIOUS' : severity === 'warn' ? 'FLAGGED' : 'CLEAN'}
                             </span>
                           )}
-                          {r.is_stale ? <span className="badge badgeWarn">STALE</span> : <span className="badge badgeOk">FRESH</span>}
+                          {!r.error && (r.is_stale ? <span className="badge badgeWarn">STALE</span> : <span className="badge badgeOk">FRESH</span>)}
                           {r.scan_requested ? <span className="badge badgeInfo">SCAN_REQUESTED</span> : null}
                         </div>
                       </div>
-                      {r.error ? <div className="err">{r.error}</div> : null}
+                      {r.error ? (
+                        <div className="errorDetail">
+                          <AlertTriangle size={12} style={{ flexShrink: 0, marginTop: 1 }} />
+                          <span>{String(r.error).includes('429') ? 'Quota exceeded (429) — not checked' : r.error}</span>
+                        </div>
+                      ) : null}
                     </td>
                     <td>{r.type}</td>
-                    <td className={`flaggingCell ${severity}`} style={{ fontWeight: 900 }}>{r.flagging_engines}</td>
-                    <td>{r.total_engines}</td>
-                    <td>{r.detection_ratio}</td>
+                    <td className={`flaggingCell ${hasError ? '' : severity}`} style={{ fontWeight: 900 }}>
+                      {hasError ? <span className="muted">—</span> : r.flagging_engines}
+                    </td>
+                    <td>{hasError ? <span className="muted">—</span> : r.total_engines}</td>
+                    <td>{hasError ? <span className="muted">—</span> : r.detection_ratio}</td>
                     <td>{r.last_scanned_display || '—'}</td>
                     <td onClick={(e) => e.stopPropagation()}>
                       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
-                        <button
-                          className="smallBtn"
-                          onClick={() => refreshOne(r.input)}
-                          disabled={!jobId}
-                          title="Fetch the latest report (uses 1 lookup)."
-                        >
-                          <RefreshCcw size={14} className={rowBusy[`refresh:${r.input}`] ? 'iconSpin' : undefined} />
-                          Refresh report
-                        </button>
-                        <button
-                          className="smallBtn primary"
-                          onClick={() => forceScanOne(r.input, r.type)}
-                          disabled={!jobId}
-                          title="Request a new scan (uses 1 lookup). Results may take a few minutes."
-                        >
-                          <RotateCcw size={14} className={rowBusy[`scan:${r.input}`] ? 'iconSpin' : undefined} />
-                          Request new scan
-                        </button>
+                        {hasError ? (
+                          <button
+                            className="smallBtn retryBtn"
+                            onClick={() => refreshOne(r.input)}
+                            disabled={!jobId}
+                            title="Retry this lookup (uses 1 lookup)."
+                          >
+                            <RefreshCcw size={14} className={rowBusy[`refresh:${r.input}`] ? 'iconSpin' : undefined} />
+                            Retry
+                          </button>
+                        ) : (
+                          <>
+                            <button
+                              className="smallBtn"
+                              onClick={() => refreshOne(r.input)}
+                              disabled={!jobId}
+                              title="Fetch the latest report (uses 1 lookup)."
+                            >
+                              <RefreshCcw size={14} className={rowBusy[`refresh:${r.input}`] ? 'iconSpin' : undefined} />
+                              Refresh report
+                            </button>
+                            <button
+                              className="smallBtn primary"
+                              onClick={() => forceScanOne(r.input, r.type)}
+                              disabled={!jobId}
+                              title="Request a new scan (uses 1 lookup). Results may take a few minutes."
+                            >
+                              <RotateCcw size={14} className={rowBusy[`scan:${r.input}`] ? 'iconSpin' : undefined} />
+                              Request new scan
+                            </button>
+                          </>
+                        )}
                       </div>
                     </td>
                   </tr>
