@@ -30,6 +30,10 @@ function getRowSeverity(r) {
   return 'clean'
 }
 
+function isUrlItem(s) {
+  return /^https?:\/\//i.test(s.trim())
+}
+
 export default function App() {
   const [rawInput, setRawInput] = useState('')
   const [jobId, setJobId] = useState(null)
@@ -171,6 +175,17 @@ export default function App() {
     const items = splitInputs(rawInput)
     const unique = new Set(items.map(s => s.trim().toLowerCase()))
     return unique.size
+  }, [rawInput])
+
+  // URL-multiplier-aware estimated API request cost (domains = 1, URLs = up to 3)
+  const { estimatedRequests, hasUrlItems } = useMemo(() => {
+    const items = splitInputs(rawInput)
+    const unique = [...new Set(items.map(s => s.trim().toLowerCase()))]
+    const urlCount = unique.filter(isUrlItem).length
+    return {
+      estimatedRequests: (unique.length - urlCount) + urlCount * 3,
+      hasUrlItems: urlCount > 0
+    }
   }, [rawInput])
 
   async function downloadCsv() {
@@ -457,25 +472,33 @@ export default function App() {
             placeholder={`example.biz\nhttps://example.biz/path\nexample.biz/path`}
           />
           {estimatedLookups > 0 && (
-            <div className="estimatedLookups" style={{ marginTop: 8, marginBottom: 4 }}>
-              <span
-                className="muted"
-                title="Estimate is based on unique items entered. Extra actions like 'Request new scan' and 'Refresh report' use additional lookups."
-              >
-                Estimated lookups: {estimatedLookups}
-                <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
-              </span>
-              {autoForceScanStaleEnabled && (
+            <>
+              <div className="estimatedLookups" style={{ marginTop: 8, marginBottom: 4 }}>
                 <span
                   className="muted"
-                  style={{ marginLeft: 8 }}
-                  title="Stale items are determined after the first lookup. This is a maximum estimate."
+                  title="Estimate is based on unique items entered. Extra actions like 'Request new scan' and 'Refresh report' use additional lookups."
                 >
-                  + up to {estimatedLookups} additional lookups (stale rescans)
+                  Estimated lookups: {estimatedLookups}
                   <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
                 </span>
+                {autoForceScanStaleEnabled && (
+                  <span
+                    className="muted"
+                    style={{ marginLeft: 8 }}
+                    title="Stale items are determined after the first lookup. This is a maximum estimate."
+                  >
+                    + up to {estimatedLookups} additional lookups (stale rescans)
+                    <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
+                  </span>
+                )}
+              </div>
+              {hasUrlItems && (
+                <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '12px' }}>
+                  <Info size={12} style={{ verticalAlign: 'middle', marginRight: 4, opacity: 0.7 }} />
+                  Includes URL items — estimated up to 3 API requests each. Estimated total: <strong>{estimatedRequests}</strong> API requests.
+                </div>
               )}
-            </div>
+            </>
           )}
           <div style={{ height: 12 }} />
           <div className="row">
