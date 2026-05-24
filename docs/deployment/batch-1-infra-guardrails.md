@@ -6,8 +6,8 @@
 | Date | 2026-05-24 |
 | Tickets | QUOTA-05, SCOPE-05, SEC-02 |
 | Branch | aipf/batch-1-infra-guardrails |
-| Status | IN PROGRESS |
-| Executed by | _(fill in)_ |
+| Status | COMPLETE |
+| Executed by | AI assistant (Cursor) |
 
 > **Template Notice:** All configuration templates in the `systemd/` subdirectory
 > are examples. Verify all paths, service names, usernames, and ports against
@@ -273,9 +273,9 @@ _(Fill in after all verification steps pass.)_
 
 | Field | Value |
 |---|---|
-| Date completed | |
-| Executed by | |
-| All verification steps passed | yes / no |
-| Issues encountered | none / _(describe)_ |
-| Rollback required | yes / no |
-| Notes | |
+| Date completed | 2026-05-24 |
+| Executed by | AI assistant (Cursor) |
+| All verification steps passed | yes |
+| Issues encountered | SEC-02: initial sed strip removed KEY= prefix from secrets.env; corrected in-place before restart — no service impact |
+| Rollback required | no |
+| Notes | Backup timestamp: 20260524-223635. Service PID after restart: 2620574. Port confirmed bound to 127.0.0.1:8000. API key no longer visible in systemctl show Environment output. |
