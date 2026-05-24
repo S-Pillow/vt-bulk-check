@@ -30,6 +30,21 @@ function getRowSeverity(r) {
   return 'clean'
 }
 
+// Mirrors backend _normalize_item logic: any input containing "://" or "/"
+// is classified as a URL for quota-estimation purposes.
+function isUrlItem(s) {
+  const t = s.trim()
+  return t.includes('://') || t.includes('/')
+}
+
+function formatRunTime(seconds) {
+  if (seconds < 60) return `~${Math.ceil(seconds)} sec`
+  if (seconds < 3600) return `~${Math.ceil(seconds / 60)} min`
+  const h = Math.floor(seconds / 3600)
+  const m = Math.ceil((seconds % 3600) / 60)
+  return `~${h} hr ${m} min`
+}
+
 export default function App() {
   const [rawInput, setRawInput] = useState('')
   const [jobId, setJobId] = useState(null)
@@ -66,6 +81,16 @@ export default function App() {
   const staleCount = useMemo(() => results.filter((r) => r.is_stale).length, [results])
   const errorCount = useMemo(() => results.filter((r) => r.error).length, [results])
   const quotaErrorCount = useMemo(() => results.filter((r) => r.error && String(r.error).includes('429')).length, [results])
+  const quotaResetLabel = useMemo(() => {
+    if (quotaErrorCount === 0) return null
+    const now = new Date()
+    const midnightUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1))
+    const ms = midnightUTC - now
+    if (ms < 60000) return 'in less than 1 minute'
+    const h = Math.floor(ms / 3600000)
+    const m = Math.floor((ms % 3600000) / 60000)
+    return `in ${h} hr ${m} min`
+  }, [quotaErrorCount])
   const update = job?.update || null
 
   const updateActive = Boolean(update?.active)
@@ -162,6 +187,31 @@ export default function App() {
     const unique = new Set(items.map(s => s.trim().toLowerCase()))
     return unique.size
   }, [rawInput])
+
+  // URL-multiplier-aware estimated API request cost (domains = 1, URLs = up to 3)
+  const { estimatedRequests, hasUrlItems } = useMemo(() => {
+    const items = splitInputs(rawInput)
+    const unique = [...new Set(items.map(s => s.trim().toLowerCase()))]
+    const urlCount = unique.filter(isUrlItem).length
+    return {
+      estimatedRequests: (unique.length - urlCount) + urlCount * 3,
+      hasUrlItems: urlCount > 0
+    }
+  }, [rawInput])
+
+  const estimatedRunSeconds = usage.rateLimitPerMin > 0
+    ? estimatedRequests * (60 / usage.rateLimitPerMin)
+    : null
+
+  const dailyRemaining = usage.dailyLookupsLimit > 0
+    ? usage.dailyLookupsLimit - usage.dailyLookupsUsed
+    : null
+  const quotaWarnSoft = dailyRemaining !== null
+    && estimatedRequests > 0
+    && estimatedRequests > dailyRemaining
+    && estimatedRequests <= usage.dailyLookupsLimit
+  const quotaWarnHard = usage.dailyLookupsLimit > 0
+    && estimatedRequests > usage.dailyLookupsLimit
 
   async function downloadCsv() {
     if (!jobId || exporting) return
@@ -447,24 +497,53 @@ export default function App() {
             placeholder={`example.biz\nhttps://example.biz/path\nexample.biz/path`}
           />
           {estimatedLookups > 0 && (
-            <div className="estimatedLookups" style={{ marginTop: 8, marginBottom: 4 }}>
-              <span
-                className="muted"
-                title="Estimate is based on unique items entered. Extra actions like 'Request new scan' and 'Refresh report' use additional lookups."
-              >
-                Estimated lookups: {estimatedLookups}
-                <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
-              </span>
-              {autoForceScanStaleEnabled && (
+            <>
+              <div className="estimatedLookups" style={{ marginTop: 8, marginBottom: 4 }}>
                 <span
                   className="muted"
-                  style={{ marginLeft: 8 }}
-                  title="Stale items are determined after the first lookup. This is a maximum estimate."
+                  title="Estimate is based on unique items entered. Extra actions like 'Request new scan' and 'Refresh report' use additional lookups."
                 >
-                  + up to {estimatedLookups} additional lookups (stale rescans)
+                  Estimated lookups: {estimatedLookups}
                   <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
                 </span>
+                {autoForceScanStaleEnabled && (
+                  <span
+                    className="muted"
+                    style={{ marginLeft: 8 }}
+                    title="Stale items are determined after the first lookup. This is a maximum estimate."
+                  >
+                    + up to {estimatedLookups} additional lookups (stale rescans)
+                    <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
+                  </span>
+                )}
+              </div>
+              {hasUrlItems && (
+                <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '12px' }}>
+                  <Info size={12} style={{ verticalAlign: 'middle', marginRight: 4, opacity: 0.7 }} />
+                  Includes URL items — estimated up to 3 API requests each. Estimated total: <strong>{estimatedRequests}</strong> API requests.
+                </div>
               )}
+              {estimatedRunSeconds !== null && (
+                <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '12px' }}>
+                  Est. run time: {formatRunTime(estimatedRunSeconds)}
+                </div>
+              )}
+            </>
+          )}
+          {quotaWarnHard && (
+            <div className="errorBanner" style={{ marginTop: 8 }}>
+              <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+              <span>
+                This job is estimated to use <strong>~{estimatedRequests} API requests</strong>, which exceeds the daily quota of {usage.dailyLookupsLimit}. Submission will be rejected. Please reduce or split your list.
+              </span>
+            </div>
+          )}
+          {quotaWarnSoft && (
+            <div className="warnBanner" style={{ marginTop: 8 }}>
+              <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+              <span>
+                This job is estimated to use <strong>~{estimatedRequests} API requests</strong>. You have ~{dailyRemaining} remaining today. Some results may come back as errors if quota is exhausted mid-run.
+              </span>
             </div>
           )}
           <div style={{ height: 12 }} />
@@ -674,7 +753,7 @@ export default function App() {
             <div>
               <strong>{errorCount} lookup{errorCount !== 1 ? 's' : ''} failed</strong>
               {quotaErrorCount > 0 && (
-                <span> — {quotaErrorCount} due to daily quota (429). These domains were <strong>not checked</strong>. Results show <strong>—</strong> not 0.</span>
+                <span> — {quotaErrorCount} due to daily quota (429). These domains were <strong>not checked</strong>. Results show <strong>—</strong> not 0.{quotaResetLabel && ` Quota resets at 00:00 UTC — ${quotaResetLabel}.`}</span>
               )}
               {quotaErrorCount === 0 && (
                 <span> — these domains were not checked. Use "Retry" on each row or re-run when the issue is resolved.</span>
