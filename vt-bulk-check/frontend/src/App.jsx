@@ -30,8 +30,11 @@ function getRowSeverity(r) {
   return 'clean'
 }
 
+// Mirrors backend _normalize_item logic: any input containing "://" or "/"
+// is classified as a URL for quota-estimation purposes.
 function isUrlItem(s) {
-  return /^https?:\/\//i.test(s.trim())
+  const t = s.trim()
+  return t.includes('://') || t.includes('/')
 }
 
 function formatRunTime(seconds) {
