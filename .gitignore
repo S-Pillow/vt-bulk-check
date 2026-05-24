@@ -9,6 +9,11 @@ __pycache__/
 # Secrets
 .env
 .env.*
+secrets.env
+
+# Backup files
+*.bak
+*.bak-*
 
 # Python venvs
 venv/

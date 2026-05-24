@@ -1,0 +1,41 @@
+# override.conf.example
+# TEMPLATE — do not copy to production without verifying all values.
+#
+# Verify the following against your actual deployment before use:
+#   - EnvironmentFile path (/etc/dns-tool/secrets.env)
+#   - VT_USAGE_FILE path (/var/lib/dns-tool/vt_usage.json)
+#   - User/group used by the service (www-data) matches chown below
+#
+# This file replaces the previous approach of setting VT_API_KEY
+# directly in an Environment= line (SEC-02).
+#
+# Changes introduced by Batch 1:
+#   SEC-02  — API key loaded from EnvironmentFile instead of inline
+#   QUOTA-05 — VT_USAGE_FILE points to stable /var/lib path
+#
+# Prerequisites before applying to the production host:
+#
+#   1. Create the secrets file directory and file:
+#      sudo mkdir -p /etc/dns-tool
+#      sudo cp secrets.env.example /etc/dns-tool/secrets.env
+#      sudo nano /etc/dns-tool/secrets.env   # Replace placeholder with real value
+#      sudo chown root:www-data /etc/dns-tool/secrets.env
+#      sudo chmod 640 /etc/dns-tool/secrets.env
+#
+#   2. Create the usage counter directory:
+#      sudo mkdir -p /var/lib/dns-tool
+#      sudo chown www-data:www-data /var/lib/dns-tool
+#      sudo chmod 750 /var/lib/dns-tool
+#
+# Do NOT add VT_API_KEY= with a real value to this file or any
+# file that may be committed to version control.
+#
+# To install on the production host:
+#   sudo mkdir -p /etc/systemd/system/dns-tool-backend.service.d
+#   sudo cp override.conf.example \
+#       /etc/systemd/system/dns-tool-backend.service.d/override.conf
+#   sudo systemctl daemon-reload
+
+[Service]
+EnvironmentFile=/etc/dns-tool/secrets.env
+Environment="VT_USAGE_FILE=/var/lib/dns-tool/vt_usage.json"
