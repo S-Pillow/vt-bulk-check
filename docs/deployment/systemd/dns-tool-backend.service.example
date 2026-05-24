@@ -1,0 +1,33 @@
+# dns-tool-backend.service.example
+# TEMPLATE — do not copy to production without verifying all values.
+#
+# Verify the following against your actual deployment before use:
+#   - User and Group (currently www-data)
+#   - WorkingDirectory path
+#   - ExecStart venv path and port
+#
+# Key change introduced by Batch 1 / SCOPE-05:
+#   --host 127.0.0.1 (replaces 0.0.0.0)
+#   Binds the backend to localhost only. External traffic must route
+#   through the nginx reverse proxy.
+#
+# To install on the production host:
+#   sudo cp dns-tool-backend.service.example \
+#       /etc/systemd/system/dns-tool-backend.service
+#   sudo systemctl daemon-reload
+
+[Unit]
+Description=DNS Tool FastAPI Backend
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/dns-tool/backend
+ExecStart=/var/www/dns-tool/backend/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
