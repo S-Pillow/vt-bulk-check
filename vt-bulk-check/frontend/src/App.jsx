@@ -34,6 +34,14 @@ function isUrlItem(s) {
   return /^https?:\/\//i.test(s.trim())
 }
 
+function formatRunTime(seconds) {
+  if (seconds < 60) return `~${Math.ceil(seconds)} sec`
+  if (seconds < 3600) return `~${Math.ceil(seconds / 60)} min`
+  const h = Math.floor(seconds / 3600)
+  const m = Math.ceil((seconds % 3600) / 60)
+  return `~${h} hr ${m} min`
+}
+
 export default function App() {
   const [rawInput, setRawInput] = useState('')
   const [jobId, setJobId] = useState(null)
@@ -187,6 +195,10 @@ export default function App() {
       hasUrlItems: urlCount > 0
     }
   }, [rawInput])
+
+  const estimatedRunSeconds = usage.rateLimitPerMin > 0
+    ? estimatedRequests * (60 / usage.rateLimitPerMin)
+    : null
 
   async function downloadCsv() {
     if (!jobId || exporting) return
@@ -496,6 +508,11 @@ export default function App() {
                 <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '12px' }}>
                   <Info size={12} style={{ verticalAlign: 'middle', marginRight: 4, opacity: 0.7 }} />
                   Includes URL items — estimated up to 3 API requests each. Estimated total: <strong>{estimatedRequests}</strong> API requests.
+                </div>
+              )}
+              {estimatedRunSeconds !== null && (
+                <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '12px' }}>
+                  Est. run time: {formatRunTime(estimatedRunSeconds)}
                 </div>
               )}
             </>
