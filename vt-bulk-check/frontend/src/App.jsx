@@ -200,6 +200,16 @@ export default function App() {
     ? estimatedRequests * (60 / usage.rateLimitPerMin)
     : null
 
+  const dailyRemaining = usage.dailyLookupsLimit > 0
+    ? usage.dailyLookupsLimit - usage.dailyLookupsUsed
+    : null
+  const quotaWarnSoft = dailyRemaining !== null
+    && estimatedRequests > 0
+    && estimatedRequests > dailyRemaining
+    && estimatedRequests <= usage.dailyLookupsLimit
+  const quotaWarnHard = usage.dailyLookupsLimit > 0
+    && estimatedRequests > usage.dailyLookupsLimit
+
   async function downloadCsv() {
     if (!jobId || exporting) return
     setExporting(true)
@@ -516,6 +526,22 @@ export default function App() {
                 </div>
               )}
             </>
+          )}
+          {quotaWarnHard && (
+            <div className="errorBanner" style={{ marginTop: 8 }}>
+              <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+              <span>
+                This job is estimated to use <strong>~{estimatedRequests} API requests</strong>, which exceeds the daily quota of {usage.dailyLookupsLimit}. Submission will be rejected. Please reduce or split your list.
+              </span>
+            </div>
+          )}
+          {quotaWarnSoft && (
+            <div className="warnBanner" style={{ marginTop: 8 }}>
+              <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+              <span>
+                This job is estimated to use <strong>~{estimatedRequests} API requests</strong>. You have ~{dailyRemaining} remaining today. Some results may come back as errors if quota is exhausted mid-run.
+              </span>
+            </div>
           )}
           <div style={{ height: 12 }} />
           <div className="row">

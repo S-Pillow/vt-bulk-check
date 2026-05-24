@@ -468,6 +468,23 @@ tr.hasError:hover {
   color: var(--danger);
 }
 
+/* Pre-submission quota warning banner (amber/warn tier) */
+.warnBanner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 8px;
+  padding: 10px 14px;
+  color: var(--warn);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.warnBanner strong {
+  color: var(--warn);
+}
+
 /* Retry button for failed rows */
 .retryBtn {
   border-color: rgba(239, 68, 68, 0.45) !important;
