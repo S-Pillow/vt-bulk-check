@@ -66,6 +66,16 @@ export default function App() {
   const staleCount = useMemo(() => results.filter((r) => r.is_stale).length, [results])
   const errorCount = useMemo(() => results.filter((r) => r.error).length, [results])
   const quotaErrorCount = useMemo(() => results.filter((r) => r.error && String(r.error).includes('429')).length, [results])
+  const quotaResetLabel = useMemo(() => {
+    if (quotaErrorCount === 0) return null
+    const now = new Date()
+    const midnightUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1))
+    const ms = midnightUTC - now
+    if (ms < 60000) return 'in less than 1 minute'
+    const h = Math.floor(ms / 3600000)
+    const m = Math.floor((ms % 3600000) / 60000)
+    return `in ${h} hr ${m} min`
+  }, [quotaErrorCount])
   const update = job?.update || null
 
   const updateActive = Boolean(update?.active)
@@ -674,7 +684,7 @@ export default function App() {
             <div>
               <strong>{errorCount} lookup{errorCount !== 1 ? 's' : ''} failed</strong>
               {quotaErrorCount > 0 && (
-                <span> — {quotaErrorCount} due to daily quota (429). These domains were <strong>not checked</strong>. Results show <strong>—</strong> not 0.</span>
+                <span> — {quotaErrorCount} due to daily quota (429). These domains were <strong>not checked</strong>. Results show <strong>—</strong> not 0.{quotaResetLabel && ` Quota resets at 00:00 UTC — ${quotaResetLabel}.`}</span>
               )}
               {quotaErrorCount === 0 && (
                 <span> — these domains were not checked. Use "Retry" on each row or re-run when the issue is resolved.</span>
