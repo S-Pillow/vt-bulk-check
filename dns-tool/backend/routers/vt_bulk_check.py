@@ -691,6 +691,20 @@ async def submit(req: SubmitRequest):
             logger.warning(f"Rejected item '{raw}': {type(e).__name__}: {str(e)}")
             rejected.append(raw)
 
+    # SEC-04: reject if estimated VirusTotal API request cost exceeds the daily quota.
+    # Domains cost 1 request each; URLs may cost up to 3 requests each.
+    estimated_requests = sum(3 if item_type == "url" else 1 for _, item_type, _, _ in accepted_items)
+    if estimated_requests > DAILY_LOOKUPS_LIMIT:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Submission is estimated to use {estimated_requests} VirusTotal API requests. "
+                f"The daily quota limit is {DAILY_LOOKUPS_LIMIT} requests. "
+                f"Domains count as 1 request and URLs may count as up to 3 requests. "
+                f"Please reduce or split your list."
+            )
+        )
+
     job_id = str(uuid.uuid4())
     logger.info(f"Created job {job_id}: {len(accepted_items)} accepted, {len(rejected)} rejected")
 
