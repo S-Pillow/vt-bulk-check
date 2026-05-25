@@ -800,6 +800,13 @@ export default function App() {
           </div>
         )}
 
+        {/* PERSIST-01: temporary-results notice — shown only when job is done */}
+        {job?.status === 'done' && (
+          <div className="infoNote" style={{ marginBottom: 8 }}>
+            Results are temporary — export before closing this tab or restarting the service.
+          </div>
+        )}
+
         {/* Error summary banner */}
         {errorCount > 0 && (
           <div className="errorBanner">
