@@ -62,6 +62,8 @@ export default function App() {
   const [bulkBusy, setBulkBusy] = useState(false)
   const [selectedNormalized, setSelectedNormalized] = useState(() => new Set())
   const [theme, setTheme] = useState('dark')
+  const [rejectedItems, setRejectedItems] = useState([])
+  const [jobGone, setJobGone] = useState(false)
   const [usage, setUsage] = useState({
     jobLookupsUsed: 0,
     dailyLookupsUsed: 0,
@@ -158,6 +160,12 @@ export default function App() {
   async function fetchJob(id) {
     // Avoid any intermediary caching while we rely on polling for UI truth.
     const resp = await fetch(`/api/vt-bulk-check/jobs/${id}?t=${Date.now()}`, { cache: 'no-store' })
+    if (resp.status === 404) {
+      // PERSIST-04: typed error so the polling loop can distinguish job-gone from other failures
+      const err = new Error('Job not found')
+      err.isJobGone = true
+      throw err
+    }
     if (!resp.ok) throw new Error(await resp.text())
     return resp.json()
   }
@@ -354,7 +362,16 @@ export default function App() {
           }
         }
       } catch (e) {
-        if (!cancelled) setError(String(e?.message || e))
+        if (!cancelled) {
+          if (e.isJobGone) {
+            // PERSIST-04: job no longer exists (service restarted) — stop polling and show friendly message
+            clearInterval(pollRef.current)
+            pollRef.current = null
+            setJobGone(true)
+          } else {
+            setError(String(e?.message || e))
+          }
+        }
       }
     }
 
@@ -377,6 +394,8 @@ export default function App() {
     setJob(null)
     setSelected(null)
     setSelectedNormalized(new Set())
+    setRejectedItems([])
+    setJobGone(false)
     autoTriggeredForJobIdRef.current = null
 
     try {
@@ -389,6 +408,7 @@ export default function App() {
       if (!resp.ok) throw new Error(await resp.text())
       const data = await resp.json()
       setJobId(data.job_id)
+      setRejectedItems(data.rejected || [])
     } catch (e) {
       setError(String(e?.message || e))
     } finally {
@@ -569,6 +589,18 @@ export default function App() {
             )}
           </div>
           {error ? <div style={{ marginTop: 10 }} className="err">{error}</div> : null}
+          {/* DATA-01: rejected items notice — persists until next submission */}
+          {rejectedItems.length > 0 && (
+            <div className="warnBanner" style={{ marginTop: 10 }}>
+              <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+              <div>
+                <strong>{rejectedItems.length} input{rejectedItems.length !== 1 ? 's' : ''} could not be parsed and were skipped:</strong>{' '}
+                {rejectedItems.map((r, i) => (
+                  <span key={i}><code>{r}</code>{i < rejectedItems.length - 1 ? ', ' : ''}</span>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="card cardAccent">
@@ -745,6 +777,49 @@ export default function App() {
         </div>
 
         <div style={{ height: 8 }} />
+
+        {/* PERSIST-04: job no longer available after service restart */}
+        {jobGone && (
+          <div className="errorBanner" style={{ marginBottom: 8 }}>
+            <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+            <div>
+              <strong>This job is no longer available.</strong>{' '}
+              Results are stored in memory only and are lost when the service restarts. If you exported the CSV before this happened, your data is safe.
+            </div>
+          </div>
+        )}
+
+        {/* DATA-02: fatal job error banner — safe fixed message, never shows raw error_message */}
+        {job?.status === 'error' && (
+          <div className="errorBanner" style={{ marginBottom: 8 }}>
+            <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+            <div>
+              <strong>Job failed.</strong>{' '}
+              The job encountered an unexpected error. Please retry or contact the tool maintainer if the issue continues.
+            </div>
+          </div>
+        )}
+
+        {/* PERSIST-01: temporary-results notice — shown only when job is done */}
+        {job?.status === 'done' && (
+          <div className="infoNote" style={{ marginBottom: 8 }}>
+            Results are temporary — export before closing this tab or restarting the service.
+          </div>
+        )}
+
+        {/* PERSIST-02: prominent secondary export button — shown only when job is done */}
+        {job?.status === 'done' && (
+          <div style={{ marginBottom: 12 }}>
+            <button
+              className="btn btnSecondary"
+              onClick={downloadCsv}
+              disabled={exporting}
+              title="Download results as CSV"
+            >
+              {exporting ? 'Exporting…' : 'Export CSV'}
+            </button>
+          </div>
+        )}
 
         {/* Error summary banner */}
         {errorCount > 0 && (
