@@ -756,6 +756,7 @@ async def get_job(job_id: str):
             "status": job.status,
             "processed": job.processed,
             "total": job.total,
+            "error_message": job.error_message,
             "update": {
                 "active": job.update_active,
                 "phase": job.update_phase,

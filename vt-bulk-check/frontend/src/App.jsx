@@ -746,6 +746,17 @@ export default function App() {
 
         <div style={{ height: 8 }} />
 
+        {/* DATA-02: fatal job error banner — safe fixed message, never shows raw error_message */}
+        {job?.status === 'error' && (
+          <div className="errorBanner" style={{ marginBottom: 8 }}>
+            <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+            <div>
+              <strong>Job failed.</strong>{' '}
+              The job encountered an unexpected error. Please retry or contact the tool maintainer if the issue continues.
+            </div>
+          </div>
+        )}
+
         {/* Error summary banner */}
         {errorCount > 0 && (
           <div className="errorBanner">
