@@ -63,6 +63,7 @@ export default function App() {
   const [selectedNormalized, setSelectedNormalized] = useState(() => new Set())
   const [theme, setTheme] = useState('dark')
   const [rejectedItems, setRejectedItems] = useState([])
+  const [jobGone, setJobGone] = useState(false)
   const [usage, setUsage] = useState({
     jobLookupsUsed: 0,
     dailyLookupsUsed: 0,
@@ -159,6 +160,12 @@ export default function App() {
   async function fetchJob(id) {
     // Avoid any intermediary caching while we rely on polling for UI truth.
     const resp = await fetch(`/api/vt-bulk-check/jobs/${id}?t=${Date.now()}`, { cache: 'no-store' })
+    if (resp.status === 404) {
+      // PERSIST-04: typed error so the polling loop can distinguish job-gone from other failures
+      const err = new Error('Job not found')
+      err.isJobGone = true
+      throw err
+    }
     if (!resp.ok) throw new Error(await resp.text())
     return resp.json()
   }
@@ -355,7 +362,16 @@ export default function App() {
           }
         }
       } catch (e) {
-        if (!cancelled) setError(String(e?.message || e))
+        if (!cancelled) {
+          if (e.isJobGone) {
+            // PERSIST-04: job no longer exists (service restarted) — stop polling and show friendly message
+            clearInterval(pollRef.current)
+            pollRef.current = null
+            setJobGone(true)
+          } else {
+            setError(String(e?.message || e))
+          }
+        }
       }
     }
 
@@ -379,6 +395,7 @@ export default function App() {
     setSelected(null)
     setSelectedNormalized(new Set())
     setRejectedItems([])
+    setJobGone(false)
     autoTriggeredForJobIdRef.current = null
 
     try {
@@ -760,6 +777,17 @@ export default function App() {
         </div>
 
         <div style={{ height: 8 }} />
+
+        {/* PERSIST-04: job no longer available after service restart */}
+        {jobGone && (
+          <div className="errorBanner" style={{ marginBottom: 8 }}>
+            <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+            <div>
+              <strong>This job is no longer available.</strong>{' '}
+              Results are stored in memory only and are lost when the service restarts. If you exported the CSV before this happened, your data is safe.
+            </div>
+          </div>
+        )}
 
         {/* DATA-02: fatal job error banner — safe fixed message, never shows raw error_message */}
         {job?.status === 'error' && (
