@@ -807,6 +807,20 @@ export default function App() {
           </div>
         )}
 
+        {/* PERSIST-02: prominent secondary export button — shown only when job is done */}
+        {job?.status === 'done' && (
+          <div style={{ marginBottom: 12 }}>
+            <button
+              className="btn btnSecondary"
+              onClick={downloadCsv}
+              disabled={exporting}
+              title="Download results as CSV"
+            >
+              {exporting ? 'Exporting…' : 'Export CSV'}
+            </button>
+          </div>
+        )}
+
         {/* Error summary banner */}
         {errorCount > 0 && (
           <div className="errorBanner">
