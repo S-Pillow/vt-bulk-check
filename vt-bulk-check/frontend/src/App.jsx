@@ -62,6 +62,7 @@ export default function App() {
   const [bulkBusy, setBulkBusy] = useState(false)
   const [selectedNormalized, setSelectedNormalized] = useState(() => new Set())
   const [theme, setTheme] = useState('dark')
+  const [rejectedItems, setRejectedItems] = useState([])
   const [usage, setUsage] = useState({
     jobLookupsUsed: 0,
     dailyLookupsUsed: 0,
@@ -377,6 +378,7 @@ export default function App() {
     setJob(null)
     setSelected(null)
     setSelectedNormalized(new Set())
+    setRejectedItems([])
     autoTriggeredForJobIdRef.current = null
 
     try {
@@ -389,6 +391,7 @@ export default function App() {
       if (!resp.ok) throw new Error(await resp.text())
       const data = await resp.json()
       setJobId(data.job_id)
+      setRejectedItems(data.rejected || [])
     } catch (e) {
       setError(String(e?.message || e))
     } finally {
@@ -569,6 +572,18 @@ export default function App() {
             )}
           </div>
           {error ? <div style={{ marginTop: 10 }} className="err">{error}</div> : null}
+          {/* DATA-01: rejected items notice — persists until next submission */}
+          {rejectedItems.length > 0 && (
+            <div className="warnBanner" style={{ marginTop: 10 }}>
+              <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+              <div>
+                <strong>{rejectedItems.length} input{rejectedItems.length !== 1 ? 's' : ''} could not be parsed and were skipped:</strong>{' '}
+                {rejectedItems.map((r, i) => (
+                  <span key={i}><code>{r}</code>{i < rejectedItems.length - 1 ? ', ' : ''}</span>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="card cardAccent">
