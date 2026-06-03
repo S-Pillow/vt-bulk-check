@@ -64,6 +64,7 @@ export default function App() {
   const [theme, setTheme] = useState('dark')
   const [rejectedItems, setRejectedItems] = useState([])
   const [jobGone, setJobGone] = useState(false)
+  const [useDomainReports, setUseDomainReports] = useState(false)
   const [usage, setUsage] = useState({
     jobLookupsUsed: 0,
     dailyLookupsUsed: 0,
@@ -403,7 +404,7 @@ export default function App() {
       const resp = await fetch('/api/vt-bulk-check/submit', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ items })
+        body: JSON.stringify({ items, use_domain_reports: useDomainReports })
       })
       if (!resp.ok) throw new Error(await resp.text())
       const data = await resp.json()
@@ -516,6 +517,24 @@ export default function App() {
             onChange={(e) => setRawInput(e.target.value)}
             placeholder={`example.biz\nhttps://example.biz/path\nexample.biz/path`}
           />
+          <div style={{ marginTop: 10, marginBottom: 4 }}>
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={useDomainReports}
+                onChange={(e) => setUseDomainReports(e.target.checked)}
+                style={{ marginTop: 2, flexShrink: 0 }}
+              />
+              <div>
+                <span style={{ fontWeight: 600, color: 'var(--text)', fontSize: '13px' }}>
+                  Use domain reports for bare domains
+                </span>
+                <div className="muted" style={{ fontSize: '11px', marginTop: 3, lineHeight: 1.4 }}>
+                  Default: bare domains are checked as URL reports, like http://example.com/, to match VirusTotal's website behavior. Enable this to check domain records instead.
+                </div>
+              </div>
+            </label>
+          </div>
           {estimatedLookups > 0 && (
             <>
               <div className="estimatedLookups" style={{ marginTop: 8, marginBottom: 4 }}>
