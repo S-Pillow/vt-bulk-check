@@ -1014,6 +1014,67 @@ async def get_usage(job_id: Optional[str] = Query(None, alias="jobId")):
     }
 
 
+@router.get("/latest-job")
+async def get_latest_job():
+    """
+    Return metadata for the most recently completed job, or {"job_id": null}.
+
+    Never returns full results (results_by_normalized, item_order).
+    Never returns use_domain_reports.
+    Makes no VirusTotal API calls and consumes 0 quota.
+    """
+    global _LATEST_JOB_ID
+
+    # Check in-memory _JOBS first (fastest path — no file I/O)
+    if _LATEST_JOB_ID:
+        async with _JOBS_LOCK:
+            job = _JOBS.get(_LATEST_JOB_ID)
+        if job and job.status == "done":
+            # Belt-and-suspenders expiration check at request time (PERSIST-05F)
+            if job.completed_at and (time.time() - job.completed_at) > _LATEST_JOB_MAX_AGE_SECONDS:
+                async with _JOBS_LOCK:
+                    _JOBS.pop(_LATEST_JOB_ID, None)
+                _LATEST_JOB_ID = None
+                _delete_latest_job_snapshot()
+                return {"job_id": None}
+            return {
+                "job_id": job.job_id,
+                "status": job.status,
+                "total": job.total,
+                "processed": job.processed,
+                "completed_at": job.completed_at,
+                "submitted_at": job.submitted_at,
+                "rejected_count": 0,
+            }
+        # ID set but job not in memory (evicted) — fall through to file
+        _LATEST_JOB_ID = None
+
+    # Fall back to snapshot file
+    data = _load_latest_job_snapshot()
+    if not data:
+        return {"job_id": None}
+
+    # Reload into _JOBS so subsequent GET /jobs/{job_id} calls work
+    try:
+        job = _reconstruct_job_from_snapshot(data)
+        async with _JOBS_LOCK:
+            _JOBS[job.job_id] = job
+        _LATEST_JOB_ID = job.job_id
+    except Exception as e:
+        logger.warning(f"latest-job: failed to reload snapshot into _JOBS: {e}")
+        return {"job_id": None}
+
+    return {
+        "job_id": data["job_id"],
+        "status": data.get("status", "done"),
+        "total": data.get("total", 0),
+        "processed": data.get("processed", 0),
+        "completed_at": data.get("completed_at"),
+        "submitted_at": data.get("submitted_at"),
+        "rejected_count": len(data.get("rejected") or []),
+    }
+
+
 @router.get("/jobs/{job_id}/rescan-eligibility")
 async def get_rescan_eligibility(job_id: str):
     """
