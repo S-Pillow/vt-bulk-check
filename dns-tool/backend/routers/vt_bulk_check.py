@@ -694,6 +694,7 @@ async def _process_job(job_id: str) -> None:
 
         # Build snapshot dict under lock, then write to disk after releasing lock.
         snapshot_to_save: Optional[Dict[str, Any]] = None
+        history_to_append: Optional[Dict[str, Any]] = None
         async with _JOBS_LOCK:
             job3 = _JOBS.get(job_id)
             if job3:
@@ -716,17 +717,60 @@ async def _process_job(job_id: str) -> None:
                     "results_by_normalized": {k: dict(v) for k, v in job3.results_by_normalized.items()},
                     "rejected": [],
                 }
-        # Disk write happens OUTSIDE the lock — failure is logged, never propagated
+                if not job3.usage_history_written:
+                    job3.usage_history_written = True
+                    history_to_append = {
+                        "ts": job3.completed_at,
+                        "job_id": job3.job_id,
+                        "status": "done",
+                        "submitted_at": job3.submitted_at,
+                        "completed_at": job3.completed_at,
+                        "accepted_count": job3.total,
+                        "rejected_count": job3.rejected_count,
+                        "processed": job3.processed,
+                        "total": job3.total,
+                        "url_count": sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "url"),
+                        "domain_count": sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "domain"),
+                        "actual_lookups": job3.lookups_used,
+                        "estimated_requests": job3.estimated_requests,
+                        "use_domain_reports": job3.use_domain_reports,
+                        "error_summary": None,
+                    }
+        # All disk writes happen OUTSIDE the lock — failures are logged, never propagated
         if snapshot_to_save is not None:
             _save_latest_job_snapshot(snapshot_to_save)
+        if history_to_append is not None:
+            _append_usage_history(history_to_append)
 
     except Exception as e:
         logger.error(f"Fatal error in job {job_id}: {type(e).__name__}: {str(e)}", exc_info=True)
+        error_history: Optional[Dict[str, Any]] = None
         async with _JOBS_LOCK:
             job4 = _JOBS.get(job_id)
             if job4:
                 job4.status = "error"
                 job4.error_message = str(e)
+                if not job4.usage_history_written:
+                    job4.usage_history_written = True
+                    error_history = {
+                        "ts": time.time(),
+                        "job_id": job4.job_id,
+                        "status": "error",
+                        "submitted_at": job4.submitted_at,
+                        "completed_at": time.time(),
+                        "accepted_count": job4.total,
+                        "rejected_count": job4.rejected_count,
+                        "processed": job4.processed,
+                        "total": job4.total,
+                        "url_count": sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "url"),
+                        "domain_count": sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "domain"),
+                        "actual_lookups": job4.lookups_used,
+                        "estimated_requests": job4.estimated_requests,
+                        "use_domain_reports": job4.use_domain_reports,
+                        "error_summary": type(e).__name__,
+                    }
+        if error_history is not None:
+            _append_usage_history(error_history)
 
 
 def _job_results_list(job: JobState) -> List[Dict[str, Any]]:
