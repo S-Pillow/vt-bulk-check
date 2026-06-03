@@ -606,11 +606,31 @@ async def _process_job(job_id: str) -> None:
                     job2.processed += 1
                     job2.results_by_normalized[normalized]["error"] = error_msg
 
+        # Build snapshot dict under lock, then write to disk after releasing lock.
+        snapshot_to_save: Optional[Dict[str, Any]] = None
         async with _JOBS_LOCK:
             job3 = _JOBS.get(job_id)
             if job3:
                 job3.status = "done"
+                job3.completed_at = time.time()
                 logger.info(f"Job {job_id} completed successfully: {job3.processed}/{job3.total} items processed")
+                snapshot_to_save = {
+                    "schema_version": 1,
+                    "job_id": job3.job_id,
+                    "status": "done",
+                    "submitted_at": job3.submitted_at,
+                    "completed_at": job3.completed_at,
+                    "processed": job3.processed,
+                    "total": job3.total,
+                    "error_message": job3.error_message,
+                    "use_domain_reports": job3.use_domain_reports,
+                    "item_order": list(job3.item_order),
+                    "results_by_normalized": {k: dict(v) for k, v in job3.results_by_normalized.items()},
+                    "rejected": [],
+                }
+        # Disk write happens OUTSIDE the lock — failure is logged, never propagated
+        if snapshot_to_save is not None:
+            _save_latest_job_snapshot(snapshot_to_save)
 
     except Exception as e:
         logger.error(f"Fatal error in job {job_id}: {type(e).__name__}: {str(e)}", exc_info=True)
@@ -825,7 +845,8 @@ async def submit(req: SubmitRequest):
     logger.info(f"Created job {job_id}: {len(accepted_items)} accepted, {len(rejected)} rejected")
 
     job = JobState(job_id=job_id, status="running", processed=0, total=len(accepted_items),
-                   use_domain_reports=req.use_domain_reports)
+                   use_domain_reports=req.use_domain_reports,
+                   submitted_at=time.time())
     for original, item_type, normalized, normalized_full in accepted_items:
         key = normalized
         job.item_order.append(key)
