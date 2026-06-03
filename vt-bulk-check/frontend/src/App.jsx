@@ -521,9 +521,9 @@ export default function App() {
               <div className="estimatedLookups" style={{ marginTop: 8, marginBottom: 4 }}>
                 <span
                   className="muted"
-                  title="Estimate is based on unique items entered. Extra actions like 'Request new scan' and 'Refresh report' use additional lookups."
+                  title="Unique parsed inputs. Domain reports use 1 API request. URL reports use 1 request if VirusTotal already has the exact URL, or up to 3 if it has not. Refresh and new scan actions use additional requests."
                 >
-                  Estimated lookups: {estimatedLookups}
+                  Unique items: {estimatedLookups}
                   <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
                 </span>
                 {autoForceScanStaleEnabled && (
@@ -532,15 +532,21 @@ export default function App() {
                     style={{ marginLeft: 8 }}
                     title="Stale items are determined after the first lookup. This is a maximum estimate."
                   >
-                    + up to {estimatedLookups} additional lookups (stale rescans)
+                    + up to {estimatedLookups} additional API requests (stale rescans)
                     <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
                   </span>
                 )}
               </div>
-              {hasUrlItems && (
+              {estimatedRequests > 0 && (
                 <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '12px' }}>
                   <Info size={12} style={{ verticalAlign: 'middle', marginRight: 4, opacity: 0.7 }} />
-                  Includes URL items — estimated up to 3 API requests each. Estimated total: <strong>{estimatedRequests}</strong> API requests.
+                  Estimated API requests: <strong>{estimatedRequests}</strong> — URL items may cost up to 3 requests each (1 if VirusTotal already has the exact URL, up to 3 if it does not). Domain items cost 1 request each.
+                </div>
+              )}
+              {estimatedLookups > 0 && (
+                <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '11px', opacity: 0.8 }}>
+                  <Info size={11} style={{ verticalAlign: 'middle', marginRight: 3, opacity: 0.6 }} />
+                  Bare domains are currently checked as domain records in this tool. VirusTotal's website may show the URL record by default.
                 </div>
               )}
               {estimatedRunSeconds !== null && (
@@ -573,17 +579,7 @@ export default function App() {
               Run check
             </button>
             {jobId ? (
-              <>
-                <div className="muted">Job: {jobId}</div>
-                <button
-                  className="smallBtn exportBtn"
-                  onClick={downloadCsv}
-                  disabled={exporting || !jobId || job?.status === 'running'}
-                  title={job?.status === 'running' ? 'Export available when job completes' : 'Download CSV (domain, flagging)'}
-                >
-                  {exporting ? 'Exporting…' : 'Export CSV'}
-                </button>
-              </>
+              <div className="muted">Job: {jobId}</div>
             ) : (
               <div className="muted">Enter items then run.</div>
             )}
@@ -813,7 +809,7 @@ export default function App() {
             <button
               className="btn btnSecondary"
               onClick={downloadCsv}
-              disabled={exporting}
+              disabled={exporting || !jobId}
               title="Download results as CSV"
             >
               {exporting ? 'Exporting…' : 'Export CSV'}
