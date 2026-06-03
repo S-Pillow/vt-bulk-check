@@ -65,6 +65,9 @@ export default function App() {
   const [rejectedItems, setRejectedItems] = useState([])
   const [jobGone, setJobGone] = useState(false)
   const [useDomainReports, setUseDomainReports] = useState(false)
+  const [latestJobMeta, setLatestJobMeta] = useState(null)
+  const [isRecoveredJob, setIsRecoveredJob] = useState(false)
+  const [pendingExport, setPendingExport] = useState(false)
   const [usage, setUsage] = useState({
     jobLookupsUsed: 0,
     dailyLookupsUsed: 0,
@@ -179,6 +182,24 @@ export default function App() {
     if (!resp.ok) throw new Error(await resp.text())
     return resp.json()
   }
+
+  async function fetchLatestJobMeta() {
+    try {
+      const resp = await fetch(`/api/vt-bulk-check/latest-job?t=${Date.now()}`, { cache: 'no-store' })
+      if (!resp.ok) return
+      const data = await resp.json()
+      if (data?.job_id) {
+        setLatestJobMeta(data)
+      }
+    } catch (e) {
+      // Silently ignore — recovery banner is optional
+    }
+  }
+
+  // Fetch latest-job metadata once on page load
+  useEffect(() => {
+    fetchLatestJobMeta()
+  }, [])
 
   // Calculate daily usage percentage and warnings
   const dailyUsagePercent = usage.dailyLookupsLimit > 0
@@ -331,6 +352,14 @@ export default function App() {
     }
   }
 
+  // When a recovered job finishes loading and pendingExport is set, trigger CSV download
+  useEffect(() => {
+    if (pendingExport && job?.status === 'done' && jobId) {
+      setPendingExport(false)
+      downloadCsv()
+    }
+  }, [pendingExport, job?.status, jobId])
+
   useEffect(() => {
     if (!jobId) return
 
@@ -408,6 +437,9 @@ export default function App() {
     setSelectedNormalized(new Set())
     setRejectedItems([])
     setJobGone(false)
+    setLatestJobMeta(null)
+    setIsRecoveredJob(false)
+    setPendingExport(false)
     autoTriggeredForJobIdRef.current = null
 
     try {
@@ -629,6 +661,44 @@ export default function App() {
               </div>
             </div>
           )}
+          {/* PERSIST-05E: recovery banner — shown only when a previous completed job exists and no current job is loaded */}
+          {latestJobMeta?.job_id && !jobId && (
+            <div className="recoveryBanner" style={{ marginTop: 10 }}>
+              <div className="recoveryBannerText">
+                <strong>A previous completed job is available.</strong>
+                {latestJobMeta.total != null && (
+                  <span className="muted">
+                    {' '}{latestJobMeta.total} item{latestJobMeta.total !== 1 ? 's' : ''}{latestJobMeta.completed_at ? `, completed ${new Date(latestJobMeta.completed_at * 1000).toLocaleString()}` : ''}
+                  </span>
+                )}
+              </div>
+              <div className="recoveryBannerActions">
+                <button
+                  className="btn btnSecondary"
+                  style={{ fontSize: 13 }}
+                  onClick={() => {
+                    setJobId(latestJobMeta.job_id)
+                    setIsRecoveredJob(true)
+                    setLatestJobMeta(null)
+                  }}
+                >
+                  Load results
+                </button>
+                <button
+                  className="btn btnSecondary"
+                  style={{ fontSize: 13 }}
+                  onClick={() => {
+                    setJobId(latestJobMeta.job_id)
+                    setIsRecoveredJob(true)
+                    setLatestJobMeta(null)
+                    setPendingExport(true)
+                  }}
+                >
+                  Export CSV
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="card cardAccent">
@@ -832,6 +902,13 @@ export default function App() {
         {job?.status === 'done' && (
           <div className="infoNote" style={{ marginBottom: 8 }}>
             Results are temporary — export before closing this tab or restarting the service.
+          </div>
+        )}
+
+        {/* PERSIST-05E: recovery session note — shown after loading a recovered job */}
+        {isRecoveredJob && job?.status === 'done' && (
+          <div className="infoNote" style={{ marginBottom: 8 }}>
+            Results recovered from a previous session.
           </div>
         )}
 

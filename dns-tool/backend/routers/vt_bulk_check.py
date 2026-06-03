@@ -34,6 +34,11 @@ RATE_LIMIT_PER_MIN = 4
 MAX_AUTO_RESCANS_PER_RUN = 25  # Maximum stale items to auto-rescan per run
 AUTO_RESCAN_IF_OLDER_THAN_DAYS = 7  # Only auto-rescan items older than this threshold
 
+# ----- Latest Job Snapshot -----
+_LATEST_JOB_FILE = Path("/var/lib/dns-tool/vt_latest_job.json")
+_LATEST_JOB_MAX_AGE_SECONDS = 7 * 24 * 60 * 60  # 7 days
+_LATEST_JOB_ID: Optional[str] = None  # tracks job_id of the most recently saved/loaded snapshot
+
 
 @dataclass
 class UsageState:
@@ -197,6 +202,9 @@ class JobState:
     error_message: Optional[str] = None
     # Lookup mode: False = URL reports for bare domains (default), True = domain reports
     use_domain_reports: bool = False
+    # Timestamps for snapshot/recovery
+    submitted_at: Optional[float] = None
+    completed_at: Optional[float] = None
     # Usage tracking for this job
     lookups_used: int = 0
     # Auto-update (stale re-scan + refresh) progress tracking
@@ -447,6 +455,129 @@ async def _reanalyze_url(url: str) -> None:
         raise HTTPException(status_code=resp.status_code, detail=f"VirusTotal error: {resp.text}")
 
 
+def _save_latest_job_snapshot(snapshot: Dict[str, Any]) -> None:
+    """Write a pre-built snapshot dict to disk atomically with 0600 permissions.
+
+    The caller must build ``snapshot`` *after* releasing _JOBS_LOCK so no disk
+    I/O ever occurs while the lock is held.  Any failure is logged and silently
+    swallowed — it must never affect job completion.
+    """
+    global _LATEST_JOB_ID
+    try:
+        _LATEST_JOB_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _LATEST_JOB_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot))
+        tmp.chmod(0o600)
+        os.replace(tmp, _LATEST_JOB_FILE)
+        _LATEST_JOB_FILE.chmod(0o600)
+        _LATEST_JOB_ID = snapshot["job_id"]
+        logger.info(f"Saved latest job snapshot: {snapshot['job_id']}")
+    except Exception as e:
+        logger.warning(f"Failed to save latest job snapshot: {e}")
+
+
+def _delete_latest_job_snapshot() -> None:
+    """Delete the snapshot file, logging a warning on failure (never raises)."""
+    try:
+        if _LATEST_JOB_FILE.exists():
+            _LATEST_JOB_FILE.unlink()
+            logger.info("Deleted latest job snapshot file")
+    except Exception as e:
+        logger.warning(f"Failed to delete latest job snapshot: {e}")
+
+
+def _load_latest_job_snapshot() -> Optional[Dict[str, Any]]:
+    """Read and validate the snapshot file.
+
+    Returns the dict if valid and unexpired, None otherwise.
+    Corrupt, expired, or unknown-schema files are deleted to prevent
+    repeated warnings on every startup.  Never raises.
+    """
+    try:
+        if not _LATEST_JOB_FILE.exists():
+            return None
+        raw = _LATEST_JOB_FILE.read_text()
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(f"Latest job snapshot corrupt (JSON): {e} — deleting")
+        _delete_latest_job_snapshot()
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to read latest job snapshot: {e}")
+        return None
+
+    try:
+        if data.get("schema_version") != 1:
+            logger.warning(f"Latest job snapshot unknown schema_version={data.get('schema_version')} — deleting")
+            _delete_latest_job_snapshot()
+            return None
+
+        completed_at = data.get("completed_at")
+        if not completed_at:
+            logger.warning("Latest job snapshot missing completed_at — deleting")
+            _delete_latest_job_snapshot()
+            return None
+
+        age = time.time() - float(completed_at)
+        if age > _LATEST_JOB_MAX_AGE_SECONDS:
+            logger.info(f"Latest job snapshot expired ({age / 86400:.1f} days old) — deleting")
+            _delete_latest_job_snapshot()
+            return None
+
+        return data
+    except Exception as e:
+        logger.warning(f"Latest job snapshot validation error: {e} — deleting")
+        _delete_latest_job_snapshot()
+        return None
+
+
+def _reconstruct_job_from_snapshot(data: Dict[str, Any]) -> "JobState":
+    """Rebuild a JobState from a validated snapshot dict."""
+    job = JobState(
+        job_id=data["job_id"],
+        status="done",
+        processed=int(data.get("processed", 0)),
+        total=int(data.get("total", 0)),
+        error_message=data.get("error_message"),
+        use_domain_reports=bool(data.get("use_domain_reports", False)),
+        submitted_at=data.get("submitted_at"),
+        completed_at=data.get("completed_at"),
+    )
+    job.item_order = list(data.get("item_order") or [])
+    job.results_by_normalized = dict(data.get("results_by_normalized") or {})
+    # Ensure no auto-update state is active on a recovered job
+    job.update_active = False
+    job.update_phase = None
+    job.update_total = 0
+    job.update_done = 0
+    job.update_message = None
+    job.update_error = None
+    return job
+
+
+def _startup_load_latest_job_sync() -> None:
+    """Load the latest completed job snapshot into _JOBS at module import time.
+
+    Runs synchronously before any request is served.  Any failure is caught and
+    logged — this function must never raise.
+    """
+    global _LATEST_JOB_ID
+    try:
+        data = _load_latest_job_snapshot()
+        if not data:
+            return
+        job = _reconstruct_job_from_snapshot(data)
+        _JOBS[job.job_id] = job
+        _LATEST_JOB_ID = job.job_id
+        logger.info(f"Startup: recovered latest job {job.job_id} into _JOBS")
+    except Exception as e:
+        logger.warning(f"Startup: failed to recover latest job snapshot: {e}")
+
+
+# Load snapshot once at import time — runs before any request handler is called.
+_startup_load_latest_job_sync()
+
+
 async def _process_job(job_id: str) -> None:
     async with _JOBS_LOCK:
         job = _JOBS.get(job_id)
@@ -498,11 +629,31 @@ async def _process_job(job_id: str) -> None:
                     job2.processed += 1
                     job2.results_by_normalized[normalized]["error"] = error_msg
 
+        # Build snapshot dict under lock, then write to disk after releasing lock.
+        snapshot_to_save: Optional[Dict[str, Any]] = None
         async with _JOBS_LOCK:
             job3 = _JOBS.get(job_id)
             if job3:
                 job3.status = "done"
+                job3.completed_at = time.time()
                 logger.info(f"Job {job_id} completed successfully: {job3.processed}/{job3.total} items processed")
+                snapshot_to_save = {
+                    "schema_version": 1,
+                    "job_id": job3.job_id,
+                    "status": "done",
+                    "submitted_at": job3.submitted_at,
+                    "completed_at": job3.completed_at,
+                    "processed": job3.processed,
+                    "total": job3.total,
+                    "error_message": job3.error_message,
+                    "use_domain_reports": job3.use_domain_reports,
+                    "item_order": list(job3.item_order),
+                    "results_by_normalized": {k: dict(v) for k, v in job3.results_by_normalized.items()},
+                    "rejected": [],
+                }
+        # Disk write happens OUTSIDE the lock — failure is logged, never propagated
+        if snapshot_to_save is not None:
+            _save_latest_job_snapshot(snapshot_to_save)
 
     except Exception as e:
         logger.error(f"Fatal error in job {job_id}: {type(e).__name__}: {str(e)}", exc_info=True)
@@ -717,7 +868,8 @@ async def submit(req: SubmitRequest):
     logger.info(f"Created job {job_id}: {len(accepted_items)} accepted, {len(rejected)} rejected")
 
     job = JobState(job_id=job_id, status="running", processed=0, total=len(accepted_items),
-                   use_domain_reports=req.use_domain_reports)
+                   use_domain_reports=req.use_domain_reports,
+                   submitted_at=time.time())
     for original, item_type, normalized, normalized_full in accepted_items:
         key = normalized
         job.item_order.append(key)
@@ -859,6 +1011,67 @@ async def get_usage(job_id: Optional[str] = Query(None, alias="jobId")):
         "dailyLookupsUsed": daily_used,
         "dailyLookupsLimit": DAILY_LOOKUPS_LIMIT,
         "rateLimitPerMin": RATE_LIMIT_PER_MIN,
+    }
+
+
+@router.get("/latest-job")
+async def get_latest_job():
+    """
+    Return metadata for the most recently completed job, or {"job_id": null}.
+
+    Never returns full results (results_by_normalized, item_order).
+    Never returns use_domain_reports.
+    Makes no VirusTotal API calls and consumes 0 quota.
+    """
+    global _LATEST_JOB_ID
+
+    # Check in-memory _JOBS first (fastest path — no file I/O)
+    if _LATEST_JOB_ID:
+        async with _JOBS_LOCK:
+            job = _JOBS.get(_LATEST_JOB_ID)
+        if job and job.status == "done":
+            # Belt-and-suspenders expiration check at request time (PERSIST-05F)
+            if job.completed_at and (time.time() - job.completed_at) > _LATEST_JOB_MAX_AGE_SECONDS:
+                async with _JOBS_LOCK:
+                    _JOBS.pop(_LATEST_JOB_ID, None)
+                _LATEST_JOB_ID = None
+                _delete_latest_job_snapshot()
+                return {"job_id": None}
+            return {
+                "job_id": job.job_id,
+                "status": job.status,
+                "total": job.total,
+                "processed": job.processed,
+                "completed_at": job.completed_at,
+                "submitted_at": job.submitted_at,
+                "rejected_count": 0,
+            }
+        # ID set but job not in memory (evicted) — fall through to file
+        _LATEST_JOB_ID = None
+
+    # Fall back to snapshot file
+    data = _load_latest_job_snapshot()
+    if not data:
+        return {"job_id": None}
+
+    # Reload into _JOBS so subsequent GET /jobs/{job_id} calls work
+    try:
+        job = _reconstruct_job_from_snapshot(data)
+        async with _JOBS_LOCK:
+            _JOBS[job.job_id] = job
+        _LATEST_JOB_ID = job.job_id
+    except Exception as e:
+        logger.warning(f"latest-job: failed to reload snapshot into _JOBS: {e}")
+        return {"job_id": None}
+
+    return {
+        "job_id": data["job_id"],
+        "status": data.get("status", "done"),
+        "total": data.get("total", 0),
+        "processed": data.get("processed", 0),
+        "completed_at": data.get("completed_at"),
+        "submitted_at": data.get("submitted_at"),
+        "rejected_count": len(data.get("rejected") or []),
     }
 
 
