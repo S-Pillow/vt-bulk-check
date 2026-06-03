@@ -523,7 +523,7 @@ export default function App() {
                   className="muted"
                   title="Estimate is based on unique items entered. Extra actions like 'Request new scan' and 'Refresh report' use additional lookups."
                 >
-                  Estimated lookups: {estimatedLookups}
+                  Unique items: {estimatedLookups}
                   <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
                 </span>
                 {autoForceScanStaleEnabled && (
@@ -532,7 +532,7 @@ export default function App() {
                     style={{ marginLeft: 8 }}
                     title="Stale items are determined after the first lookup. This is a maximum estimate."
                   >
-                    + up to {estimatedLookups} additional lookups (stale rescans)
+                    + up to {estimatedLookups} additional API requests (stale rescans)
                     <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
                   </span>
                 )}
