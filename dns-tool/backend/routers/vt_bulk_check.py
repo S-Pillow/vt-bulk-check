@@ -555,6 +555,29 @@ def _reconstruct_job_from_snapshot(data: Dict[str, Any]) -> "JobState":
     return job
 
 
+def _startup_load_latest_job_sync() -> None:
+    """Load the latest completed job snapshot into _JOBS at module import time.
+
+    Runs synchronously before any request is served.  Any failure is caught and
+    logged — this function must never raise.
+    """
+    global _LATEST_JOB_ID
+    try:
+        data = _load_latest_job_snapshot()
+        if not data:
+            return
+        job = _reconstruct_job_from_snapshot(data)
+        _JOBS[job.job_id] = job
+        _LATEST_JOB_ID = job.job_id
+        logger.info(f"Startup: recovered latest job {job.job_id} into _JOBS")
+    except Exception as e:
+        logger.warning(f"Startup: failed to recover latest job snapshot: {e}")
+
+
+# Load snapshot once at import time — runs before any request handler is called.
+_startup_load_latest_job_sync()
+
+
 async def _process_job(job_id: str) -> None:
     async with _JOBS_LOCK:
         job = _JOBS.get(job_id)
