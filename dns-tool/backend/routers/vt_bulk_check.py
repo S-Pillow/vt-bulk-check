@@ -34,6 +34,13 @@ RATE_LIMIT_PER_MIN = 4
 MAX_AUTO_RESCANS_PER_RUN = 25  # Maximum stale items to auto-rescan per run
 AUTO_RESCAN_IF_OLDER_THAN_DAYS = 7  # Only auto-rescan items older than this threshold
 
+# ----- Daily Usage History -----
+_DAILY_HISTORY_FILE = Path("/var/lib/dns-tool/vt_daily_history.json")
+_DAILY_HISTORY_MAX_DAYS = 90
+
+# ----- Per-Job JSONL Usage History -----
+_USAGE_HISTORY_FILE = Path("/var/lib/dns-tool/vt_usage_history.jsonl")
+
 # ----- Latest Job Snapshot -----
 _LATEST_JOB_FILE = Path("/var/lib/dns-tool/vt_latest_job.json")
 _LATEST_JOB_MAX_AGE_SECONDS = 7 * 24 * 60 * 60  # 7 days
@@ -80,7 +87,11 @@ def _load_usage_state() -> UsageState:
 
 
 def _save_usage_state(state: UsageState) -> None:
-    """Save usage state to persistent storage."""
+    """Save usage state to persistent storage.
+
+    vt_usage.json is always written first.  The daily history update is a
+    separate side-effect; its failure must never affect vt_usage.json.
+    """
     try:
         _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _USAGE_FILE.write_text(json.dumps({
@@ -89,6 +100,34 @@ def _save_usage_state(state: UsageState) -> None:
         }))
     except Exception as e:
         logger.warning(f"Failed to save usage state: {e}")
+    # Additive side-effect — isolated try/except so a failure here never affects vt_usage.json
+    _update_daily_history(state.date_utc, state.daily_lookups_used)
+
+
+def _update_daily_history(date_str: str, count: int) -> None:
+    """Atomically update the rolling 90-day daily usage history file.
+
+    Failure is logged and silently swallowed — must never block VT API calls.
+    """
+    try:
+        history: Dict[str, Any] = {}
+        if _DAILY_HISTORY_FILE.exists():
+            try:
+                history = json.loads(_DAILY_HISTORY_FILE.read_text())
+                if not isinstance(history, dict):
+                    history = {}
+            except Exception:
+                history = {}  # corrupt — start fresh
+        history[date_str] = count
+        # Prune to last 90 days
+        if len(history) > _DAILY_HISTORY_MAX_DAYS:
+            for old_key in sorted(history.keys())[:-_DAILY_HISTORY_MAX_DAYS]:
+                del history[old_key]
+        tmp = _DAILY_HISTORY_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(history, sort_keys=True))
+        os.replace(tmp, _DAILY_HISTORY_FILE)
+    except Exception as e:
+        logger.warning(f"Failed to update daily history: {e}")
 
 
 async def _increment_usage(job_id: Optional[str] = None) -> None:
