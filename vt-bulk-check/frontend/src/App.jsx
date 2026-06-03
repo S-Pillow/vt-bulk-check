@@ -576,7 +576,9 @@ export default function App() {
               {estimatedLookups > 0 && (
                 <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '11px', opacity: 0.8 }}>
                   <Info size={11} style={{ verticalAlign: 'middle', marginRight: 3, opacity: 0.6 }} />
-                  Bare domains are currently checked as domain records in this tool. VirusTotal's website may show the URL record by default.
+                  {useDomainReports
+                    ? 'Bare domains are checked as domain records.'
+                    : 'Bare domains are checked as URL reports by default, like http://example.com/.'}
                 </div>
               )}
               {estimatedRunSeconds !== null && (
