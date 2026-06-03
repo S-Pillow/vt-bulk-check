@@ -498,6 +498,22 @@ async def _reanalyze_url(url: str) -> None:
         raise HTTPException(status_code=resp.status_code, detail=f"VirusTotal error: {resp.text}")
 
 
+def _append_usage_history(summary: Dict[str, Any]) -> None:
+    """Append one metadata-only summary record to the per-job usage history JSONL file.
+
+    Must be called OUTSIDE _JOBS_LOCK.  Failure is logged and swallowed —
+    it must never affect job completion.  The record must contain only counts
+    and metadata — never domain names, URLs, item_order, or results_by_normalized.
+    """
+    try:
+        _USAGE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_USAGE_HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary) + "\n")
+        logger.debug(f"Usage history appended for job {summary.get('job_id')}")
+    except Exception as e:
+        logger.warning(f"Failed to append usage history for job {summary.get('job_id')}: {e}")
+
+
 def _save_latest_job_snapshot(snapshot: Dict[str, Any]) -> None:
     """Write a pre-built snapshot dict to disk atomically with 0600 permissions.
 
