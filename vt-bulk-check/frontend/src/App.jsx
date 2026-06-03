@@ -521,7 +521,7 @@ export default function App() {
               <div className="estimatedLookups" style={{ marginTop: 8, marginBottom: 4 }}>
                 <span
                   className="muted"
-                  title="Estimate is based on unique items entered. Extra actions like 'Request new scan' and 'Refresh report' use additional lookups."
+                  title="Unique parsed inputs. Domain reports use 1 API request. URL reports use 1 request if VirusTotal already has the exact URL, or up to 3 if it has not. Refresh and new scan actions use additional requests."
                 >
                   Unique items: {estimatedLookups}
                   <Info size={12} style={{ marginLeft: 4, verticalAlign: 'middle', opacity: 0.7 }} />
@@ -537,10 +537,10 @@ export default function App() {
                   </span>
                 )}
               </div>
-              {hasUrlItems && (
+              {estimatedRequests > 0 && (
                 <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '12px' }}>
                   <Info size={12} style={{ verticalAlign: 'middle', marginRight: 4, opacity: 0.7 }} />
-                  Includes URL items — estimated up to 3 API requests each. Estimated total: <strong>{estimatedRequests}</strong> API requests.
+                  Estimated API requests: <strong>{estimatedRequests}</strong> — URL items may cost up to 3 requests each (1 if VirusTotal already has the exact URL, up to 3 if it does not). Domain items cost 1 request each.
                 </div>
               )}
               {estimatedRunSeconds !== null && (
