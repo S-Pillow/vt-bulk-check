@@ -235,8 +235,8 @@ _CURRENT_JOB_ID: ContextVar[Optional[str]] = ContextVar("current_job_id", defaul
 def _format_last_scanned(ts: Optional[int]) -> Optional[str]:
     if not ts:
         return None
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
-    return f"{dt.month}/{dt.day}/{dt.year}, {dt.strftime('%-I:%M:%S %p')}"
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
 
 def _is_stale(ts: Optional[int], threshold_days: int = 5) -> bool:
@@ -776,11 +776,25 @@ async def export_job_csv(job_id: str):
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         results = _job_results_list(job)
+        # Option B: read normalized_full_url from the raw result dicts while the
+        # lock is held so we can populate checked_as without exposing
+        # normalized_full_url in the public GET /jobs/{job_id} response.
+        raw_by_key = {
+            key: job.results_by_normalized.get(key, {})
+            for key in job.item_order
+        }
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["domain", "type", "flagging", "total_engines", "detection_ratio", "last_scanned", "status", "error"])
-    for r in results:
+    writer.writerow(["input", "checked_as", "type", "flagging", "total_engines", "detection_ratio", "last_scanned", "status", "error"])
+    # zip is safe: _job_results_list preserves item_order order
+    for r, key in zip(results, job.item_order):
+        raw_r = raw_by_key.get(key, {})
+        item_type = r.get("type", "")
+        if item_type == "url":
+            checked_as = raw_r.get("normalized_full_url") or r.get("normalized", "")
+        else:
+            checked_as = r.get("normalized", "")
         error = r.get("error") or ""
         if error:
             status = "ERROR"
@@ -790,7 +804,8 @@ async def export_job_csv(job_id: str):
             status = "OK"
         writer.writerow([
             r.get("input", ""),
-            r.get("type", ""),
+            checked_as,
+            item_type,
             "" if error else r.get("flagging_engines", 0),
             "" if error else r.get("total_engines", 0),
             "" if error else r.get("detection_ratio", ""),
