@@ -579,17 +579,7 @@ export default function App() {
               Run check
             </button>
             {jobId ? (
-              <>
-                <div className="muted">Job: {jobId}</div>
-                <button
-                  className="smallBtn exportBtn"
-                  onClick={downloadCsv}
-                  disabled={exporting || !jobId || job?.status === 'running'}
-                  title={job?.status === 'running' ? 'Export available when job completes' : 'Download CSV (domain, flagging)'}
-                >
-                  {exporting ? 'Exporting…' : 'Export CSV'}
-                </button>
-              </>
+              <div className="muted">Job: {jobId}</div>
             ) : (
               <div className="muted">Enter items then run.</div>
             )}
@@ -819,7 +809,7 @@ export default function App() {
             <button
               className="btn btnSecondary"
               onClick={downloadCsv}
-              disabled={exporting}
+              disabled={exporting || !jobId}
               title="Download results as CSV"
             >
               {exporting ? 'Exporting…' : 'Export CSV'}
