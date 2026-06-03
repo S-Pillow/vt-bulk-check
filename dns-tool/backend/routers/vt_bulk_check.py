@@ -142,6 +142,7 @@ def _get_current_usage() -> Tuple[int, str]:
 
 class SubmitRequest(BaseModel):
     items: List[str]
+    use_domain_reports: bool = False
 
 
 class RefreshRequest(BaseModel):
