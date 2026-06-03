@@ -24,3 +24,7 @@ node_modules/
 dist/
 .vite/
 
+# Runtime data — never commit
+vt_latest_job.json
+vt_latest_job.tmp
+
