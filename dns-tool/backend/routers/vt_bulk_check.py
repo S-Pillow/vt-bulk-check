@@ -267,7 +267,7 @@ def _get_report_age_days(ts: Optional[int]) -> Optional[float]:
     return (now - ts) / 86400
 
 
-def _normalize_item(raw: str) -> Tuple[str, Literal["domain", "url"], str]:
+def _normalize_item(raw: str, use_domain_reports: bool = False) -> Tuple[str, Literal["domain", "url"], str]:
     s = (raw or "").strip()
     if not s:
         raise ValueError("Empty")
@@ -284,7 +284,12 @@ def _normalize_item(raw: str) -> Tuple[str, Literal["domain", "url"], str]:
     domain = s.strip(".").lower()
     if not domain or " " in domain:
         raise ValueError("Invalid domain")
-    return domain, "domain", domain
+
+    # Bare domain: use domain report (opt-in) or URL report (default, matches VT website behavior)
+    if use_domain_reports:
+        return domain, "domain", domain
+    url_target = f"http://{domain}/"
+    return url_target, "url", url_target
 
 
 def _vt_url_id(url: str) -> str:
