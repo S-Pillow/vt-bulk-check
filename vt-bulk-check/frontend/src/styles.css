@@ -513,6 +513,31 @@ tr.hasError:hover {
   z-index: 1000;
 }
 
+/* Recovery banner for previous completed job */
+.recoveryBanner {
+  border: 1px solid var(--border2);
+  border-radius: 8px;
+  background: var(--cardSolid);
+  padding: 10px 14px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.recoveryBannerText {
+  flex: 1 1 0;
+  font-size: 13px;
+  line-height: 1.5;
+  min-width: 0;
+}
+
+.recoveryBannerActions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 /* Advanced toggle button */
 .advancedToggle:hover {
   color: var(--text);
