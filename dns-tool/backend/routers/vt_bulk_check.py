@@ -207,6 +207,10 @@ class JobState:
     completed_at: Optional[float] = None
     # Usage tracking for this job
     lookups_used: int = 0
+    # Batch 6: quota/history tracking fields
+    estimated_requests: int = 0   # conservative estimate computed at submit time
+    rejected_count: int = 0       # count of items rejected at submit (never the values)
+    usage_history_written: bool = False  # dedup guard — prevents double-append to JSONL
     # Auto-update (stale re-scan + refresh) progress tracking
     update_active: bool = False
     update_phase: Optional[Literal["scanning", "refreshing", "complete", "error"]] = None
@@ -542,6 +546,10 @@ def _reconstruct_job_from_snapshot(data: Dict[str, Any]) -> "JobState":
         use_domain_reports=bool(data.get("use_domain_reports", False)),
         submitted_at=data.get("submitted_at"),
         completed_at=data.get("completed_at"),
+        estimated_requests=int(data.get("estimated_requests", 0)),
+        rejected_count=int(data.get("rejected_count", 0)),
+        # Recovered jobs: treat history as already written (it was written at original completion)
+        usage_history_written=True,
     )
     job.item_order = list(data.get("item_order") or [])
     job.results_by_normalized = dict(data.get("results_by_normalized") or {})
@@ -647,6 +655,8 @@ async def _process_job(job_id: str) -> None:
                     "total": job3.total,
                     "error_message": job3.error_message,
                     "use_domain_reports": job3.use_domain_reports,
+                    "estimated_requests": job3.estimated_requests,
+                    "rejected_count": job3.rejected_count,
                     "item_order": list(job3.item_order),
                     "results_by_normalized": {k: dict(v) for k, v in job3.results_by_normalized.items()},
                     "rejected": [],
@@ -869,7 +879,9 @@ async def submit(req: SubmitRequest):
 
     job = JobState(job_id=job_id, status="running", processed=0, total=len(accepted_items),
                    use_domain_reports=req.use_domain_reports,
-                   submitted_at=time.time())
+                   submitted_at=time.time(),
+                   estimated_requests=estimated_requests,
+                   rejected_count=len(rejected))
     for original, item_type, normalized, normalized_full in accepted_items:
         key = normalized
         job.item_order.append(key)
