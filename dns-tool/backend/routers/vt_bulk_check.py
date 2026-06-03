@@ -235,8 +235,8 @@ _CURRENT_JOB_ID: ContextVar[Optional[str]] = ContextVar("current_job_id", defaul
 def _format_last_scanned(ts: Optional[int]) -> Optional[str]:
     if not ts:
         return None
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
-    return f"{dt.month}/{dt.day}/{dt.year}, {dt.strftime('%-I:%M:%S %p')}"
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
 
 def _is_stale(ts: Optional[int], threshold_days: int = 5) -> bool:
