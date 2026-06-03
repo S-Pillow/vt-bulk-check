@@ -198,15 +198,26 @@ export default function App() {
   }, [rawInput])
 
   // URL-multiplier-aware estimated API request cost (domains = 1, URLs = up to 3)
+  // With checkbox OFF (default): bare domains estimate as URL cost (up to 3 each)
+  // With checkbox ON: bare domains estimate as domain cost (1 each)
   const { estimatedRequests, hasUrlItems } = useMemo(() => {
     const items = splitInputs(rawInput)
     const unique = [...new Set(items.map(s => s.trim().toLowerCase()))]
-    const urlCount = unique.filter(isUrlItem).length
-    return {
-      estimatedRequests: (unique.length - urlCount) + urlCount * 3,
-      hasUrlItems: urlCount > 0
+    let total = 0
+    let urlCount = 0
+    for (const item of unique) {
+      if (isUrlItem(item)) {
+        total += 3
+        urlCount++
+      } else if (useDomainReports) {
+        total += 1
+      } else {
+        total += 3
+        urlCount++
+      }
     }
-  }, [rawInput])
+    return { estimatedRequests: total, hasUrlItems: urlCount > 0 }
+  }, [rawInput, useDomainReports])
 
   const estimatedRunSeconds = usage.rateLimitPerMin > 0
     ? estimatedRequests * (60 / usage.rateLimitPerMin)
