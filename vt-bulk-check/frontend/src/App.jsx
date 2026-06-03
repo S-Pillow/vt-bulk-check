@@ -64,6 +64,7 @@ export default function App() {
   const [theme, setTheme] = useState('dark')
   const [rejectedItems, setRejectedItems] = useState([])
   const [jobGone, setJobGone] = useState(false)
+  const [useDomainReports, setUseDomainReports] = useState(false)
   const [usage, setUsage] = useState({
     jobLookupsUsed: 0,
     dailyLookupsUsed: 0,
@@ -197,15 +198,26 @@ export default function App() {
   }, [rawInput])
 
   // URL-multiplier-aware estimated API request cost (domains = 1, URLs = up to 3)
+  // With checkbox OFF (default): bare domains estimate as URL cost (up to 3 each)
+  // With checkbox ON: bare domains estimate as domain cost (1 each)
   const { estimatedRequests, hasUrlItems } = useMemo(() => {
     const items = splitInputs(rawInput)
     const unique = [...new Set(items.map(s => s.trim().toLowerCase()))]
-    const urlCount = unique.filter(isUrlItem).length
-    return {
-      estimatedRequests: (unique.length - urlCount) + urlCount * 3,
-      hasUrlItems: urlCount > 0
+    let total = 0
+    let urlCount = 0
+    for (const item of unique) {
+      if (isUrlItem(item)) {
+        total += 3
+        urlCount++
+      } else if (useDomainReports) {
+        total += 1
+      } else {
+        total += 3
+        urlCount++
+      }
     }
-  }, [rawInput])
+    return { estimatedRequests: total, hasUrlItems: urlCount > 0 }
+  }, [rawInput, useDomainReports])
 
   const estimatedRunSeconds = usage.rateLimitPerMin > 0
     ? estimatedRequests * (60 / usage.rateLimitPerMin)
@@ -403,7 +415,7 @@ export default function App() {
       const resp = await fetch('/api/vt-bulk-check/submit', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ items })
+        body: JSON.stringify({ items, use_domain_reports: useDomainReports })
       })
       if (!resp.ok) throw new Error(await resp.text())
       const data = await resp.json()
@@ -516,6 +528,24 @@ export default function App() {
             onChange={(e) => setRawInput(e.target.value)}
             placeholder={`example.biz\nhttps://example.biz/path\nexample.biz/path`}
           />
+          <div style={{ marginTop: 10, marginBottom: 4 }}>
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={useDomainReports}
+                onChange={(e) => setUseDomainReports(e.target.checked)}
+                style={{ marginTop: 2, flexShrink: 0 }}
+              />
+              <div>
+                <span style={{ fontWeight: 600, color: 'var(--text)', fontSize: '13px' }}>
+                  Use domain reports for bare domains
+                </span>
+                <div className="muted" style={{ fontSize: '11px', marginTop: 3, lineHeight: 1.4 }}>
+                  Default: bare domains are checked as URL reports, like http://example.com/, to match VirusTotal's website behavior. Enable this to check domain records instead.
+                </div>
+              </div>
+            </label>
+          </div>
           {estimatedLookups > 0 && (
             <>
               <div className="estimatedLookups" style={{ marginTop: 8, marginBottom: 4 }}>
@@ -546,7 +576,9 @@ export default function App() {
               {estimatedLookups > 0 && (
                 <div className="muted" style={{ marginTop: 2, marginBottom: 4, fontSize: '11px', opacity: 0.8 }}>
                   <Info size={11} style={{ verticalAlign: 'middle', marginRight: 3, opacity: 0.6 }} />
-                  Bare domains are currently checked as domain records in this tool. VirusTotal's website may show the URL record by default.
+                  {useDomainReports
+                    ? 'Bare domains are checked as domain records.'
+                    : 'Bare domains are checked as URL reports by default, like http://example.com/.'}
                 </div>
               )}
               {estimatedRunSeconds !== null && (

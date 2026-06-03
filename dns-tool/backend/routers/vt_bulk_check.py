@@ -142,6 +142,7 @@ def _get_current_usage() -> Tuple[int, str]:
 
 class SubmitRequest(BaseModel):
     items: List[str]
+    use_domain_reports: bool = False
 
 
 class RefreshRequest(BaseModel):
@@ -194,6 +195,8 @@ class JobState:
     item_order: List[str] = field(default_factory=list)
     results_by_normalized: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     error_message: Optional[str] = None
+    # Lookup mode: False = URL reports for bare domains (default), True = domain reports
+    use_domain_reports: bool = False
     # Usage tracking for this job
     lookups_used: int = 0
     # Auto-update (stale re-scan + refresh) progress tracking
@@ -266,7 +269,7 @@ def _get_report_age_days(ts: Optional[int]) -> Optional[float]:
     return (now - ts) / 86400
 
 
-def _normalize_item(raw: str) -> Tuple[str, Literal["domain", "url"], str]:
+def _normalize_item(raw: str, use_domain_reports: bool = False) -> Tuple[str, Literal["domain", "url"], str]:
     s = (raw or "").strip()
     if not s:
         raise ValueError("Empty")
@@ -283,7 +286,12 @@ def _normalize_item(raw: str) -> Tuple[str, Literal["domain", "url"], str]:
     domain = s.strip(".").lower()
     if not domain or " " in domain:
         raise ValueError("Invalid domain")
-    return domain, "domain", domain
+
+    # Bare domain: use domain report (opt-in) or URL report (default, matches VT website behavior)
+    if use_domain_reports:
+        return domain, "domain", domain
+    url_target = f"http://{domain}/"
+    return url_target, "url", url_target
 
 
 def _vt_url_id(url: str) -> str:
@@ -681,7 +689,7 @@ async def submit(req: SubmitRequest):
 
     for raw in req.items or []:
         try:
-            normalized, item_type, normalized_full = _normalize_item(raw)
+            normalized, item_type, normalized_full = _normalize_item(raw, req.use_domain_reports)
             key = normalized.lower()
             if key in seen:
                 continue
@@ -708,7 +716,8 @@ async def submit(req: SubmitRequest):
     job_id = str(uuid.uuid4())
     logger.info(f"Created job {job_id}: {len(accepted_items)} accepted, {len(rejected)} rejected")
 
-    job = JobState(job_id=job_id, status="running", processed=0, total=len(accepted_items))
+    job = JobState(job_id=job_id, status="running", processed=0, total=len(accepted_items),
+                   use_domain_reports=req.use_domain_reports)
     for original, item_type, normalized, normalized_full in accepted_items:
         key = normalized
         job.item_order.append(key)
@@ -977,8 +986,15 @@ async def auto_update_stale(job_id: str, _req: AutoUpdateStaleRequest):
 
 @router.post("/refresh")
 async def refresh(req: RefreshRequest):
+    # Fetch job first so normalization uses the job's original lookup mode
+    async with _JOBS_LOCK:
+        job_check = _JOBS.get(req.job_id)
+        if not job_check:
+            raise HTTPException(status_code=404, detail="Job not found")
+        use_domain_reports = job_check.use_domain_reports
+
     try:
-        normalized, item_type, normalized_full = _normalize_item(req.item)
+        normalized, item_type, normalized_full = _normalize_item(req.item, use_domain_reports)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid item")
 
@@ -1014,8 +1030,15 @@ async def refresh(req: RefreshRequest):
 
 @router.post("/force-scan")
 async def force_scan(req: ForceScanRequest):
+    # Fetch job first so normalization uses the job's original lookup mode
+    async with _JOBS_LOCK:
+        job_check = _JOBS.get(req.job_id)
+        if not job_check:
+            raise HTTPException(status_code=404, detail="Job not found")
+        use_domain_reports = job_check.use_domain_reports
+
     try:
-        normalized, _, normalized_full = _normalize_item(req.item)
+        normalized, _, normalized_full = _normalize_item(req.item, use_domain_reports)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid item")
 
