@@ -503,7 +503,7 @@ def _append_usage_history(summary: Dict[str, Any]) -> None:
 
     Must be called OUTSIDE _JOBS_LOCK.  Failure is logged and swallowed —
     it must never affect job completion.  The record must contain only counts
-    and metadata — never domain names, URLs, item_order, or results_by_normalized.
+    and metadata — no domain names, no URLs, no input items.
     """
     try:
         _USAGE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -719,6 +719,9 @@ async def _process_job(job_id: str) -> None:
                 }
                 if not job3.usage_history_written:
                     job3.usage_history_written = True
+                    # Pre-compute counts from job state (inside lock is fine — read-only)
+                    _url_cnt = sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "url")
+                    _dom_cnt = sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "domain")
                     history_to_append = {
                         "ts": job3.completed_at,
                         "job_id": job3.job_id,
@@ -729,8 +732,8 @@ async def _process_job(job_id: str) -> None:
                         "rejected_count": job3.rejected_count,
                         "processed": job3.processed,
                         "total": job3.total,
-                        "url_count": sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "url"),
-                        "domain_count": sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "domain"),
+                        "url_count": _url_cnt,
+                        "domain_count": _dom_cnt,
                         "actual_lookups": job3.lookups_used,
                         "estimated_requests": job3.estimated_requests,
                         "use_domain_reports": job3.use_domain_reports,
@@ -752,18 +755,21 @@ async def _process_job(job_id: str) -> None:
                 job4.error_message = str(e)
                 if not job4.usage_history_written:
                     job4.usage_history_written = True
+                    _err_ts = time.time()
+                    _e_url = sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "url")
+                    _e_dom = sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "domain")
                     error_history = {
-                        "ts": time.time(),
+                        "ts": _err_ts,
                         "job_id": job4.job_id,
                         "status": "error",
                         "submitted_at": job4.submitted_at,
-                        "completed_at": time.time(),
+                        "completed_at": _err_ts,
                         "accepted_count": job4.total,
                         "rejected_count": job4.rejected_count,
                         "processed": job4.processed,
                         "total": job4.total,
-                        "url_count": sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "url"),
-                        "domain_count": sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "domain"),
+                        "url_count": _e_url,
+                        "domain_count": _e_dom,
                         "actual_lookups": job4.lookups_used,
                         "estimated_requests": job4.estimated_requests,
                         "use_domain_reports": job4.use_domain_reports,
