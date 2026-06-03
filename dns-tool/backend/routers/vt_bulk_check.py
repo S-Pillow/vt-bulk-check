@@ -1125,6 +1125,81 @@ async def get_usage(job_id: Optional[str] = Query(None, alias="jobId")):
     }
 
 
+def _format_epoch_utc(epoch: Any) -> str:
+    """Convert a Unix timestamp float to 'YYYY-MM-DD HH:MM:SS UTC', or empty string."""
+    if epoch is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return ""
+
+
+_USAGE_HISTORY_CSV_COLUMNS = [
+    "timestamp_utc", "job_id", "status",
+    "submitted_at_utc", "completed_at_utc",
+    "accepted_count", "rejected_count", "processed", "total",
+    "url_count", "domain_count", "estimated_requests",
+    "actual_lookups", "use_domain_reports", "error_summary",
+]
+
+
+@router.get("/usage-history/export")
+async def export_usage_history():
+    """
+    Download per-job usage history as CSV for API quota planning.
+
+    Reads vt_usage_history.jsonl and returns a CSV with one row per job.
+    No VirusTotal API calls are made and zero quota is consumed.
+    Corrupt JSONL lines are skipped.
+    Internal use only — no authentication required (consistent with the rest of the tool).
+    Does not expose domain names, URLs, item values, or any sensitive item-level data.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_USAGE_HISTORY_CSV_COLUMNS)
+
+    if _USAGE_HISTORY_FILE.exists():
+        try:
+            raw_text = _USAGE_HISTORY_FILE.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Failed to read usage history file: {e}")
+            raw_text = ""
+
+        for raw_line in raw_text.splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                rec = json.loads(raw_line)
+            except json.JSONDecodeError:
+                logger.warning("Skipping corrupt usage history line")
+                continue
+            writer.writerow([
+                _format_epoch_utc(rec.get("ts")),
+                rec.get("job_id", ""),
+                rec.get("status", ""),
+                _format_epoch_utc(rec.get("submitted_at")),
+                _format_epoch_utc(rec.get("completed_at")),
+                rec.get("accepted_count", ""),
+                rec.get("rejected_count", ""),
+                rec.get("processed", ""),
+                rec.get("total", ""),
+                rec.get("url_count", ""),
+                rec.get("domain_count", ""),
+                rec.get("estimated_requests", ""),
+                rec.get("actual_lookups", ""),
+                rec.get("use_domain_reports", ""),
+                rec.get("error_summary", ""),
+            ])
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="vt-usage-history.csv"'},
+    )
+
+
 @router.get("/latest-job")
 async def get_latest_job():
     """
