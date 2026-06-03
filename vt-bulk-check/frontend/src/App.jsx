@@ -277,6 +277,25 @@ export default function App() {
     }
   }
 
+  async function downloadUsageReport() {
+    setError(null)
+    try {
+      const resp = await fetch('/api/vt-bulk-check/usage-history/export')
+      if (!resp.ok) throw new Error(await resp.text())
+      const blob = await resp.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'vt-usage-history.csv'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      window.URL.revokeObjectURL(url)
+    } catch (e) {
+      setError(String(e?.message || e))
+    }
+  }
+
   async function fetchRescanEligibility() {
     if (!jobId) return null
     try {
@@ -749,6 +768,20 @@ export default function App() {
                 {dailyUsageWarning}
               </div>
             )}
+          </div>
+
+          {/* USAGE-06: Download Usage Report button for API quota planning */}
+          <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+            <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
+              Exports usage history for API quota planning.
+            </div>
+            <button
+              className="btn btnSecondary"
+              style={{ fontSize: 13 }}
+              onClick={downloadUsageReport}
+            >
+              Download Usage Report
+            </button>
           </div>
 
           <div style={{ height: 14 }} />

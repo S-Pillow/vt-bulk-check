@@ -27,4 +27,7 @@ dist/
 # Runtime data — never commit
 vt_latest_job.json
 vt_latest_job.tmp
+vt_daily_history.json
+vt_daily_history.tmp
+vt_usage_history.jsonl
 

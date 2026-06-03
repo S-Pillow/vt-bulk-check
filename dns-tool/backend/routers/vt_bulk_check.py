@@ -34,6 +34,13 @@ RATE_LIMIT_PER_MIN = 4
 MAX_AUTO_RESCANS_PER_RUN = 25  # Maximum stale items to auto-rescan per run
 AUTO_RESCAN_IF_OLDER_THAN_DAYS = 7  # Only auto-rescan items older than this threshold
 
+# ----- Daily Usage History -----
+_DAILY_HISTORY_FILE = Path("/var/lib/dns-tool/vt_daily_history.json")
+_DAILY_HISTORY_MAX_DAYS = 90
+
+# ----- Per-Job JSONL Usage History -----
+_USAGE_HISTORY_FILE = Path("/var/lib/dns-tool/vt_usage_history.jsonl")
+
 # ----- Latest Job Snapshot -----
 _LATEST_JOB_FILE = Path("/var/lib/dns-tool/vt_latest_job.json")
 _LATEST_JOB_MAX_AGE_SECONDS = 7 * 24 * 60 * 60  # 7 days
@@ -80,7 +87,11 @@ def _load_usage_state() -> UsageState:
 
 
 def _save_usage_state(state: UsageState) -> None:
-    """Save usage state to persistent storage."""
+    """Save usage state to persistent storage.
+
+    vt_usage.json is always written first.  The daily history update is a
+    separate side-effect; its failure must never affect vt_usage.json.
+    """
     try:
         _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _USAGE_FILE.write_text(json.dumps({
@@ -89,6 +100,34 @@ def _save_usage_state(state: UsageState) -> None:
         }))
     except Exception as e:
         logger.warning(f"Failed to save usage state: {e}")
+    # Additive side-effect — isolated try/except so a failure here never affects vt_usage.json
+    _update_daily_history(state.date_utc, state.daily_lookups_used)
+
+
+def _update_daily_history(date_str: str, count: int) -> None:
+    """Atomically update the rolling 90-day daily usage history file.
+
+    Failure is logged and silently swallowed — must never block VT API calls.
+    """
+    try:
+        history: Dict[str, Any] = {}
+        if _DAILY_HISTORY_FILE.exists():
+            try:
+                history = json.loads(_DAILY_HISTORY_FILE.read_text())
+                if not isinstance(history, dict):
+                    history = {}
+            except Exception:
+                history = {}  # corrupt — start fresh
+        history[date_str] = count
+        # Prune to last 90 days
+        if len(history) > _DAILY_HISTORY_MAX_DAYS:
+            for old_key in sorted(history.keys())[:-_DAILY_HISTORY_MAX_DAYS]:
+                del history[old_key]
+        tmp = _DAILY_HISTORY_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(history, sort_keys=True))
+        os.replace(tmp, _DAILY_HISTORY_FILE)
+    except Exception as e:
+        logger.warning(f"Failed to update daily history: {e}")
 
 
 async def _increment_usage(job_id: Optional[str] = None) -> None:
@@ -207,6 +246,10 @@ class JobState:
     completed_at: Optional[float] = None
     # Usage tracking for this job
     lookups_used: int = 0
+    # Batch 6: quota/history tracking fields
+    estimated_requests: int = 0   # conservative estimate computed at submit time
+    rejected_count: int = 0       # count of items rejected at submit (never the values)
+    usage_history_written: bool = False  # dedup guard — prevents double-append to JSONL
     # Auto-update (stale re-scan + refresh) progress tracking
     update_active: bool = False
     update_phase: Optional[Literal["scanning", "refreshing", "complete", "error"]] = None
@@ -455,6 +498,22 @@ async def _reanalyze_url(url: str) -> None:
         raise HTTPException(status_code=resp.status_code, detail=f"VirusTotal error: {resp.text}")
 
 
+def _append_usage_history(summary: Dict[str, Any]) -> None:
+    """Append one metadata-only summary record to the per-job usage history JSONL file.
+
+    Must be called OUTSIDE _JOBS_LOCK.  Failure is logged and swallowed —
+    it must never affect job completion.  The record must contain only counts
+    and metadata — no domain names, no URLs, no input items.
+    """
+    try:
+        _USAGE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_USAGE_HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary) + "\n")
+        logger.debug(f"Usage history appended for job {summary.get('job_id')}")
+    except Exception as e:
+        logger.warning(f"Failed to append usage history for job {summary.get('job_id')}: {e}")
+
+
 def _save_latest_job_snapshot(snapshot: Dict[str, Any]) -> None:
     """Write a pre-built snapshot dict to disk atomically with 0600 permissions.
 
@@ -542,6 +601,10 @@ def _reconstruct_job_from_snapshot(data: Dict[str, Any]) -> "JobState":
         use_domain_reports=bool(data.get("use_domain_reports", False)),
         submitted_at=data.get("submitted_at"),
         completed_at=data.get("completed_at"),
+        estimated_requests=int(data.get("estimated_requests", 0)),
+        rejected_count=int(data.get("rejected_count", 0)),
+        # Recovered jobs: treat history as already written (it was written at original completion)
+        usage_history_written=True,
     )
     job.item_order = list(data.get("item_order") or [])
     job.results_by_normalized = dict(data.get("results_by_normalized") or {})
@@ -631,6 +694,7 @@ async def _process_job(job_id: str) -> None:
 
         # Build snapshot dict under lock, then write to disk after releasing lock.
         snapshot_to_save: Optional[Dict[str, Any]] = None
+        history_to_append: Optional[Dict[str, Any]] = None
         async with _JOBS_LOCK:
             job3 = _JOBS.get(job_id)
             if job3:
@@ -647,21 +711,72 @@ async def _process_job(job_id: str) -> None:
                     "total": job3.total,
                     "error_message": job3.error_message,
                     "use_domain_reports": job3.use_domain_reports,
+                    "estimated_requests": job3.estimated_requests,
+                    "rejected_count": job3.rejected_count,
                     "item_order": list(job3.item_order),
                     "results_by_normalized": {k: dict(v) for k, v in job3.results_by_normalized.items()},
                     "rejected": [],
                 }
-        # Disk write happens OUTSIDE the lock — failure is logged, never propagated
+                if not job3.usage_history_written:
+                    job3.usage_history_written = True
+                    # Pre-compute counts from job state (inside lock is fine — read-only)
+                    _url_cnt = sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "url")
+                    _dom_cnt = sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "domain")
+                    history_to_append = {
+                        "ts": job3.completed_at,
+                        "job_id": job3.job_id,
+                        "status": "done",
+                        "submitted_at": job3.submitted_at,
+                        "completed_at": job3.completed_at,
+                        "accepted_count": job3.total,
+                        "rejected_count": job3.rejected_count,
+                        "processed": job3.processed,
+                        "total": job3.total,
+                        "url_count": _url_cnt,
+                        "domain_count": _dom_cnt,
+                        "actual_lookups": job3.lookups_used,
+                        "estimated_requests": job3.estimated_requests,
+                        "use_domain_reports": job3.use_domain_reports,
+                        "error_summary": None,
+                    }
+        # All disk writes happen OUTSIDE the lock — failures are logged, never propagated
         if snapshot_to_save is not None:
             _save_latest_job_snapshot(snapshot_to_save)
+        if history_to_append is not None:
+            _append_usage_history(history_to_append)
 
     except Exception as e:
         logger.error(f"Fatal error in job {job_id}: {type(e).__name__}: {str(e)}", exc_info=True)
+        error_history: Optional[Dict[str, Any]] = None
         async with _JOBS_LOCK:
             job4 = _JOBS.get(job_id)
             if job4:
                 job4.status = "error"
                 job4.error_message = str(e)
+                if not job4.usage_history_written:
+                    job4.usage_history_written = True
+                    _err_ts = time.time()
+                    _e_url = sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "url")
+                    _e_dom = sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "domain")
+                    error_history = {
+                        "ts": _err_ts,
+                        "job_id": job4.job_id,
+                        "status": "error",
+                        "submitted_at": job4.submitted_at,
+                        "completed_at": _err_ts,
+                        "accepted_count": job4.total,
+                        "rejected_count": job4.rejected_count,
+                        "processed": job4.processed,
+                        "total": job4.total,
+                        "url_count": _e_url,
+                        "domain_count": _e_dom,
+                        "actual_lookups": job4.lookups_used,
+                        "estimated_requests": job4.estimated_requests,
+                        "use_domain_reports": job4.use_domain_reports,
+                        "error_summary": type(e).__name__,
+                    }
+        if error_history is not None:
+            _append_usage_history(error_history)
 
 
 def _job_results_list(job: JobState) -> List[Dict[str, Any]]:
@@ -869,7 +984,9 @@ async def submit(req: SubmitRequest):
 
     job = JobState(job_id=job_id, status="running", processed=0, total=len(accepted_items),
                    use_domain_reports=req.use_domain_reports,
-                   submitted_at=time.time())
+                   submitted_at=time.time(),
+                   estimated_requests=estimated_requests,
+                   rejected_count=len(rejected))
     for original, item_type, normalized, normalized_full in accepted_items:
         key = normalized
         job.item_order.append(key)
@@ -1012,6 +1129,81 @@ async def get_usage(job_id: Optional[str] = Query(None, alias="jobId")):
         "dailyLookupsLimit": DAILY_LOOKUPS_LIMIT,
         "rateLimitPerMin": RATE_LIMIT_PER_MIN,
     }
+
+
+def _format_epoch_utc(epoch: Any) -> str:
+    """Convert a Unix timestamp float to 'YYYY-MM-DD HH:MM:SS UTC', or empty string."""
+    if epoch is None:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return ""
+
+
+_USAGE_HISTORY_CSV_COLUMNS = [
+    "timestamp_utc", "job_id", "status",
+    "submitted_at_utc", "completed_at_utc",
+    "accepted_count", "rejected_count", "processed", "total",
+    "url_count", "domain_count", "estimated_requests",
+    "actual_lookups", "use_domain_reports", "error_summary",
+]
+
+
+@router.get("/usage-history/export")
+async def export_usage_history():
+    """
+    Download per-job usage history as CSV for API quota planning.
+
+    Reads vt_usage_history.jsonl and returns a CSV with one row per job.
+    No VirusTotal API calls are made and zero quota is consumed.
+    Corrupt JSONL lines are skipped.
+    Internal use only — no authentication required (consistent with the rest of the tool).
+    Does not expose domain names, URLs, item values, or any sensitive item-level data.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_USAGE_HISTORY_CSV_COLUMNS)
+
+    if _USAGE_HISTORY_FILE.exists():
+        try:
+            raw_text = _USAGE_HISTORY_FILE.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"Failed to read usage history file: {e}")
+            raw_text = ""
+
+        for raw_line in raw_text.splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                rec = json.loads(raw_line)
+            except json.JSONDecodeError:
+                logger.warning("Skipping corrupt usage history line")
+                continue
+            writer.writerow([
+                _format_epoch_utc(rec.get("ts")),
+                rec.get("job_id", ""),
+                rec.get("status", ""),
+                _format_epoch_utc(rec.get("submitted_at")),
+                _format_epoch_utc(rec.get("completed_at")),
+                rec.get("accepted_count", ""),
+                rec.get("rejected_count", ""),
+                rec.get("processed", ""),
+                rec.get("total", ""),
+                rec.get("url_count", ""),
+                rec.get("domain_count", ""),
+                rec.get("estimated_requests", ""),
+                rec.get("actual_lookups", ""),
+                rec.get("use_domain_reports", ""),
+                rec.get("error_summary", ""),
+            ])
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="vt-usage-history.csv"'},
+    )
 
 
 @router.get("/latest-job")
