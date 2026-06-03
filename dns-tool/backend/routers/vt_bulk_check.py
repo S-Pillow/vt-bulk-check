@@ -779,7 +779,7 @@ async def export_job_csv(job_id: str):
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["domain", "type", "flagging", "total_engines", "detection_ratio", "last_scanned", "status", "error"])
+    writer.writerow(["input", "type", "flagging", "total_engines", "detection_ratio", "last_scanned", "status", "error"])
     for r in results:
         error = r.get("error") or ""
         if error:
