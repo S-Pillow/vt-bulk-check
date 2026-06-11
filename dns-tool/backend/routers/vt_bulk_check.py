@@ -40,6 +40,7 @@ _DAILY_HISTORY_MAX_DAYS = 90
 
 # ----- Per-Job JSONL Usage History -----
 _USAGE_HISTORY_FILE = Path("/var/lib/dns-tool/vt_usage_history.jsonl")
+_VT_BULK_TOOL_NAME = "vt_bulk_check"
 
 # ----- Latest Job Snapshot -----
 _LATEST_JOB_FILE = Path("/var/lib/dns-tool/vt_latest_job.json")
@@ -498,12 +499,65 @@ async def _reanalyze_url(url: str) -> None:
         raise HTTPException(status_code=resp.status_code, detail=f"VirusTotal error: {resp.text}")
 
 
+def _format_timestamp_iso(epoch: float) -> str:
+    """Convert a Unix timestamp to an ISO-8601 UTC string for shared history readers."""
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+def _build_vt_bulk_usage_history_record(
+    *,
+    ts: float,
+    job_id: str,
+    status: str,
+    submitted_at: float,
+    completed_at: float,
+    accepted_count: int,
+    rejected_count: int,
+    processed: int,
+    total: int,
+    url_count: int,
+    domain_count: int,
+    actual_lookups: int,
+    estimated_requests: int,
+    use_domain_reports: bool,
+    error_summary: Optional[str],
+) -> Dict[str, Any]:
+    """Build a metadata-only VT Bulk Check usage history record (VTFIX-02B).
+
+    Includes shared attribution fields for cross-tool reporting while preserving
+    legacy VT Bulk field names for backward compatibility.
+    """
+    return {
+        "tool_name": _VT_BULK_TOOL_NAME,
+        "timestamp": _format_timestamp_iso(completed_at),
+        "quota_units_consumed": actual_lookups,
+        "ts": ts,
+        "job_id": job_id,
+        "status": status,
+        "submitted_at": submitted_at,
+        "completed_at": completed_at,
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+        "processed": processed,
+        "total": total,
+        "url_count": url_count,
+        "domain_count": domain_count,
+        "actual_lookups": actual_lookups,
+        "estimated_requests": estimated_requests,
+        "use_domain_reports": use_domain_reports,
+        "error_summary": error_summary,
+    }
+
+
 def _append_usage_history(summary: Dict[str, Any]) -> None:
     """Append one metadata-only summary record to the per-job usage history JSONL file.
 
     Must be called OUTSIDE _JOBS_LOCK.  Failure is logged and swallowed —
     it must never affect job completion.  The record must contain only counts
     and metadata — no domain names, no URLs, no input items.
+
+    New VT Bulk records include tool_name, timestamp (ISO-8601), and
+    quota_units_consumed for shared usage attribution (VTFIX-02B).
     """
     try:
         _USAGE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -722,23 +776,23 @@ async def _process_job(job_id: str) -> None:
                     # Pre-compute counts from job state (inside lock is fine — read-only)
                     _url_cnt = sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "url")
                     _dom_cnt = sum(1 for r in job3.results_by_normalized.values() if r.get("type") == "domain")
-                    history_to_append = {
-                        "ts": job3.completed_at,
-                        "job_id": job3.job_id,
-                        "status": "done",
-                        "submitted_at": job3.submitted_at,
-                        "completed_at": job3.completed_at,
-                        "accepted_count": job3.total,
-                        "rejected_count": job3.rejected_count,
-                        "processed": job3.processed,
-                        "total": job3.total,
-                        "url_count": _url_cnt,
-                        "domain_count": _dom_cnt,
-                        "actual_lookups": job3.lookups_used,
-                        "estimated_requests": job3.estimated_requests,
-                        "use_domain_reports": job3.use_domain_reports,
-                        "error_summary": None,
-                    }
+                    history_to_append = _build_vt_bulk_usage_history_record(
+                        ts=job3.completed_at,
+                        job_id=job3.job_id,
+                        status="done",
+                        submitted_at=job3.submitted_at,
+                        completed_at=job3.completed_at,
+                        accepted_count=job3.total,
+                        rejected_count=job3.rejected_count,
+                        processed=job3.processed,
+                        total=job3.total,
+                        url_count=_url_cnt,
+                        domain_count=_dom_cnt,
+                        actual_lookups=job3.lookups_used,
+                        estimated_requests=job3.estimated_requests,
+                        use_domain_reports=job3.use_domain_reports,
+                        error_summary=None,
+                    )
         # All disk writes happen OUTSIDE the lock — failures are logged, never propagated
         if snapshot_to_save is not None:
             _save_latest_job_snapshot(snapshot_to_save)
@@ -758,23 +812,23 @@ async def _process_job(job_id: str) -> None:
                     _err_ts = time.time()
                     _e_url = sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "url")
                     _e_dom = sum(1 for r in job4.results_by_normalized.values() if r.get("type") == "domain")
-                    error_history = {
-                        "ts": _err_ts,
-                        "job_id": job4.job_id,
-                        "status": "error",
-                        "submitted_at": job4.submitted_at,
-                        "completed_at": _err_ts,
-                        "accepted_count": job4.total,
-                        "rejected_count": job4.rejected_count,
-                        "processed": job4.processed,
-                        "total": job4.total,
-                        "url_count": _e_url,
-                        "domain_count": _e_dom,
-                        "actual_lookups": job4.lookups_used,
-                        "estimated_requests": job4.estimated_requests,
-                        "use_domain_reports": job4.use_domain_reports,
-                        "error_summary": type(e).__name__,
-                    }
+                    error_history = _build_vt_bulk_usage_history_record(
+                        ts=_err_ts,
+                        job_id=job4.job_id,
+                        status="error",
+                        submitted_at=job4.submitted_at,
+                        completed_at=_err_ts,
+                        accepted_count=job4.total,
+                        rejected_count=job4.rejected_count,
+                        processed=job4.processed,
+                        total=job4.total,
+                        url_count=_e_url,
+                        domain_count=_e_dom,
+                        actual_lookups=job4.lookups_used,
+                        estimated_requests=job4.estimated_requests,
+                        use_domain_reports=job4.use_domain_reports,
+                        error_summary=type(e).__name__,
+                    )
         if error_history is not None:
             _append_usage_history(error_history)
 
@@ -1147,6 +1201,7 @@ _USAGE_HISTORY_CSV_COLUMNS = [
     "accepted_count", "rejected_count", "processed", "total",
     "url_count", "domain_count", "estimated_requests",
     "actual_lookups", "use_domain_reports", "error_summary",
+    "tool_name", "timestamp", "quota_units_consumed",
 ]
 
 
@@ -1197,6 +1252,9 @@ async def export_usage_history():
                 rec.get("actual_lookups", ""),
                 rec.get("use_domain_reports", ""),
                 rec.get("error_summary", ""),
+                rec.get("tool_name", ""),
+                rec.get("timestamp", ""),
+                rec.get("quota_units_consumed", rec.get("actual_lookups", "")),
             ])
 
     return Response(

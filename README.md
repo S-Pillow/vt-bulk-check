@@ -163,7 +163,7 @@ These files are created and managed by the backend service at runtime. **They mu
 | `/var/lib/dns-tool/vt_usage.json` | Current-day VT API quota counter. Contains `date_utc` and `daily_lookups_used`. Reset automatically at midnight UTC. |
 | `/var/lib/dns-tool/vt_latest_job.json` | Snapshot of the most recently completed job for recovery. Expires after 7 days. |
 | `/var/lib/dns-tool/vt_daily_history.json` | Rolling 90-day history of daily lookup totals. Updated as a side effect of quota counter saves. |
-| `/var/lib/dns-tool/vt_usage_history.jsonl` | Append-only per-job usage summary records. Contains metadata and counts only — no submitted domains or URLs. |
+| `/var/lib/dns-tool/vt_usage_history.jsonl` | Append-only per-job usage summary records. Contains metadata and counts only — no submitted domains or URLs. New VT Bulk records (VTFIX-02B) include `tool_name: "vt_bulk_check"`, ISO `timestamp`, and `quota_units_consumed` alongside legacy fields (`ts`, `actual_lookups`, etc.). |
 
 All four files are excluded from version control via `.gitignore`.
 
@@ -234,7 +234,7 @@ Returns metadata for the most recently completed job snapshot (job_id, submitted
 
 `GET /usage-history/export`
 
-Downloads `vt-usage-history.csv` with per-job API usage records. Returns a header-only CSV if no history exists yet. Consumes zero VT quota. Skips corrupt lines silently.
+Downloads `vt-usage-history.csv` with per-job API usage records. CSV includes attribution columns `tool_name`, `timestamp`, and `quota_units_consumed` for records appended after VTFIX-02B. Returns a header-only CSV if no history exists yet. Consumes zero VT quota. Skips corrupt lines silently.
 
 ### Refresh a single item
 

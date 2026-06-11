@@ -79,6 +79,12 @@ New fields on `JobState`:
 
 **Function:** `_append_usage_history(summary: Dict[str, Any])`
 
+**VTFIX-02B contract (future appends):** Records are built by
+`_build_vt_bulk_usage_history_record()` and include `tool_name: "vt_bulk_check"`,
+ISO-8601 `timestamp`, and `quota_units_consumed` (mapped from `actual_lookups`)
+in addition to legacy fields such as `ts` and `actual_lookups`. See
+[vtfix-02b-vtbulk-history-contract.md](vtfix-02b-vtbulk-history-contract.md).
+
 - Appends one newline-terminated JSON line per call
 - Called outside `_JOBS_LOCK` — no I/O while holding the lock
 - Creates file and parent directory if needed
