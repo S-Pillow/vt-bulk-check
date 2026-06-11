@@ -54,17 +54,25 @@ New fields on `JobState`:
 
 **File:** `/var/lib/dns-tool/vt_daily_history.json`
 
-**Format:**
+**Format (VTFIX-02D unified schema for future writes):**
 ```json
 {
-  "2026-06-01": 312,
-  "2026-06-02": 187,
-  "2026-06-03": 136
+  "2026-06-10": {
+    "schema_version": 2,
+    "total_quota_units": 8,
+    "tools": {
+      "mdi": {"quota_units": 3, "jobs": 1, "items_processed": 10},
+      "vt_bulk_check": {"quota_units": 5, "jobs": 1, "items_processed": 221},
+      "legacy": {"quota_units": 0, "jobs": 0, "items_processed": 0}
+    }
+  }
 }
 ```
 
+Legacy integer day values remain readable; they normalize to `tools.legacy` (not MDI).
+
 **Behavior:**
-- Updated as a side effect of every `_save_usage_state()` call
+- Updated additively on each quota increment (`vt_bulk_check` bucket +1) and job completion (jobs/items)
 - `vt_usage.json` is always written first; daily history failure never affects quota tracking
 - Atomic write: temp file + `os.replace`
 - Corrupt files are silently replaced on next write

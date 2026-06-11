@@ -87,7 +87,7 @@ def _load_usage_state() -> UsageState:
     return _USAGE_STATE
 
 
-def _save_usage_state(state: UsageState) -> None:
+def _save_usage_state(state: UsageState, *, daily_quota_delta: int = 0) -> None:
     """Save usage state to persistent storage.
 
     vt_usage.json is always written first.  The daily history update is a
@@ -102,31 +102,38 @@ def _save_usage_state(state: UsageState) -> None:
     except Exception as e:
         logger.warning(f"Failed to save usage state: {e}")
     # Additive side-effect — isolated try/except so a failure here never affects vt_usage.json
-    _update_daily_history(state.date_utc, state.daily_lookups_used)
+    if daily_quota_delta > 0:
+        _record_daily_tool_usage(state.date_utc, quota_delta=daily_quota_delta)
 
 
-def _update_daily_history(date_str: str, count: int) -> None:
-    """Atomically update the rolling 90-day daily usage history file.
+def _record_daily_tool_usage(
+    date_str: str,
+    *,
+    quota_delta: int = 0,
+    jobs_delta: int = 0,
+    items_delta: int = 0,
+) -> None:
+    """Additively update unified daily history for VT Bulk Check (VTFIX-02D)."""
+    import daily_history
 
-    Failure is logged and silently swallowed — must never block VT API calls.
-    """
+    if quota_delta == 0 and jobs_delta == 0 and items_delta == 0:
+        return
     try:
-        history: Dict[str, Any] = {}
-        if _DAILY_HISTORY_FILE.exists():
-            try:
-                history = json.loads(_DAILY_HISTORY_FILE.read_text())
-                if not isinstance(history, dict):
-                    history = {}
-            except Exception:
-                history = {}  # corrupt — start fresh
-        history[date_str] = count
-        # Prune to last 90 days
-        if len(history) > _DAILY_HISTORY_MAX_DAYS:
-            for old_key in sorted(history.keys())[:-_DAILY_HISTORY_MAX_DAYS]:
-                del history[old_key]
-        tmp = _DAILY_HISTORY_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(history, sort_keys=True))
-        os.replace(tmp, _DAILY_HISTORY_FILE)
+        data = daily_history.load_history_file(_DAILY_HISTORY_FILE)
+        daily_history.record_tool_usage(
+            data,
+            date_str,
+            daily_history.TOOL_VT_BULK,
+            quota_delta=quota_delta,
+            jobs_delta=jobs_delta,
+            items_delta=items_delta,
+        )
+        daily_history.save_history_file(
+            _DAILY_HISTORY_FILE,
+            data,
+            max_days=_DAILY_HISTORY_MAX_DAYS,
+            indent=None,
+        )
     except Exception as e:
         logger.warning(f"Failed to update daily history: {e}")
 
@@ -148,7 +155,7 @@ async def _increment_usage(job_id: Optional[str] = None) -> None:
         
         # Increment daily counter
         _USAGE_STATE.daily_lookups_used += 1
-        _save_usage_state(_USAGE_STATE)
+        _save_usage_state(_USAGE_STATE, daily_quota_delta=1)
         
         logger.debug(f"Usage incremented: daily={_USAGE_STATE.daily_lookups_used}")
     
@@ -798,6 +805,11 @@ async def _process_job(job_id: str) -> None:
             _save_latest_job_snapshot(snapshot_to_save)
         if history_to_append is not None:
             _append_usage_history(history_to_append)
+            _record_daily_tool_usage(
+                _get_utc_date_str(),
+                jobs_delta=1,
+                items_delta=int(history_to_append.get("processed") or 0),
+            )
 
     except Exception as e:
         logger.error(f"Fatal error in job {job_id}: {type(e).__name__}: {str(e)}", exc_info=True)
@@ -831,6 +843,12 @@ async def _process_job(job_id: str) -> None:
                     )
         if error_history is not None:
             _append_usage_history(error_history)
+            if error_history is not None:
+                _record_daily_tool_usage(
+                    _get_utc_date_str(),
+                    jobs_delta=1,
+                    items_delta=int(error_history.get("processed") or 0),
+                )
 
 
 def _job_results_list(job: JobState) -> List[Dict[str, Any]]:
