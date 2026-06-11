@@ -17,6 +17,8 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+from quota_lock import QuotaLockTimeout, quota_lock
+
 logger = logging.getLogger("vt_bulk_check")
 
 router = APIRouter(prefix="/vt-bulk-check")
@@ -55,7 +57,7 @@ class UsageState:
     daily_lookups_used: int = 0
 
 
-_USAGE_STATE: Optional[UsageState] = None
+_SHARED_FILE_MODE = 0o660
 
 
 def _get_utc_date_str() -> str:
@@ -63,45 +65,70 @@ def _get_utc_date_str() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
 
-def _load_usage_state() -> UsageState:
-    """Load usage state from persistent storage."""
-    global _USAGE_STATE
-    
+def _chmod_shared_file(path: Path) -> None:
+    """Best-effort mode restore for shared runtime files (group dns-tool, mode 660)."""
+    try:
+        os.chmod(path, _SHARED_FILE_MODE)
+    except OSError as e:
+        logger.warning(f"Failed to chmod shared file {path}: {e}")
+
+
+def _load_usage_state_unlocked() -> UsageState:
+    """Load usage state from disk without acquiring flock."""
     today = _get_utc_date_str()
-    
     if _USAGE_FILE.exists():
         try:
             data = json.loads(_USAGE_FILE.read_text())
             stored_date = data.get("date_utc", "")
             if stored_date == today:
-                _USAGE_STATE = UsageState(
+                return UsageState(
                     date_utc=today,
-                    daily_lookups_used=data.get("daily_lookups_used", 0)
+                    daily_lookups_used=int(data.get("daily_lookups_used", 0) or 0),
                 )
-                return _USAGE_STATE
         except Exception as e:
             logger.warning(f"Failed to load usage state: {e}")
-    
-    # Reset for new day or on error
-    _USAGE_STATE = UsageState(date_utc=today, daily_lookups_used=0)
-    return _USAGE_STATE
+    return UsageState(date_utc=today, daily_lookups_used=0)
+
+
+def _disk_usage_date() -> Optional[str]:
+    """Return date_utc stored on disk, or None if missing/unreadable."""
+    if not _USAGE_FILE.exists():
+        return None
+    try:
+        data = json.loads(_USAGE_FILE.read_text())
+        return data.get("date_utc") or None
+    except Exception:
+        return None
+
+
+def _save_usage_state_unlocked(state: UsageState) -> None:
+    """Persist vt_usage.json only (caller must hold exclusive flock)."""
+    _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({
+        "date_utc": state.date_utc,
+        "daily_lookups_used": state.daily_lookups_used,
+    })
+    tmp = _USAGE_FILE.with_suffix(".tmp")
+    tmp.write_text(payload)
+    os.replace(tmp, _USAGE_FILE)
+    _chmod_shared_file(_USAGE_FILE)
 
 
 def _save_usage_state(state: UsageState, *, daily_quota_delta: int = 0) -> None:
-    """Save usage state to persistent storage.
+    """Save usage state to persistent storage under exclusive flock.
 
     vt_usage.json is always written first.  The daily history update is a
     separate side-effect; its failure must never affect vt_usage.json.
     """
     try:
-        _USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _USAGE_FILE.write_text(json.dumps({
-            "date_utc": state.date_utc,
-            "daily_lookups_used": state.daily_lookups_used
-        }))
+        with quota_lock("exclusive"):
+            _save_usage_state_unlocked(state)
+    except QuotaLockTimeout as e:
+        logger.warning(f"Quota lock timeout saving usage state: {e}")
+        return
     except Exception as e:
         logger.warning(f"Failed to save usage state: {e}")
-    # Additive side-effect — isolated try/except so a failure here never affects vt_usage.json
+        return
     if daily_quota_delta > 0:
         _record_daily_tool_usage(state.date_utc, quota_delta=daily_quota_delta)
 
@@ -119,47 +146,62 @@ def _record_daily_tool_usage(
     if quota_delta == 0 and jobs_delta == 0 and items_delta == 0:
         return
     try:
-        data = daily_history.load_history_file(_DAILY_HISTORY_FILE)
-        daily_history.record_tool_usage(
-            data,
-            date_str,
-            daily_history.TOOL_VT_BULK,
-            quota_delta=quota_delta,
-            jobs_delta=jobs_delta,
-            items_delta=items_delta,
-        )
-        daily_history.save_history_file(
-            _DAILY_HISTORY_FILE,
-            data,
-            max_days=_DAILY_HISTORY_MAX_DAYS,
-            indent=None,
-        )
+        with quota_lock("exclusive"):
+            data = daily_history.load_history_file(_DAILY_HISTORY_FILE)
+            daily_history.record_tool_usage(
+                data,
+                date_str,
+                daily_history.TOOL_VT_BULK,
+                quota_delta=quota_delta,
+                jobs_delta=jobs_delta,
+                items_delta=items_delta,
+            )
+            daily_history.save_history_file(
+                _DAILY_HISTORY_FILE,
+                data,
+                max_days=_DAILY_HISTORY_MAX_DAYS,
+                indent=None,
+            )
+            _chmod_shared_file(_DAILY_HISTORY_FILE)
+    except QuotaLockTimeout as e:
+        logger.warning(f"Quota lock timeout updating daily history: {e}")
     except Exception as e:
         logger.warning(f"Failed to update daily history: {e}")
 
 
 async def _increment_usage(job_id: Optional[str] = None) -> None:
-    """Increment usage counters for a VT API call."""
-    global _USAGE_STATE
-    
+    """Increment usage counters for a VT API call.
+
+    Always re-reads vt_usage.json from disk under exclusive flock before writing.
+    Daily-history v2 quota attribution is a separate side-effect after the live
+    counter write succeeds.
+    """
     async with _USAGE_LOCK:
         today = _get_utc_date_str()
-        
-        # Load or reset state if needed
-        if _USAGE_STATE is None or _USAGE_STATE.date_utc != today:
-            _USAGE_STATE = _load_usage_state()
-        
-        # Reset if date changed since load
-        if _USAGE_STATE.date_utc != today:
-            _USAGE_STATE = UsageState(date_utc=today, daily_lookups_used=0)
-        
-        # Increment daily counter
-        _USAGE_STATE.daily_lookups_used += 1
-        _save_usage_state(_USAGE_STATE, daily_quota_delta=1)
-        
-        logger.debug(f"Usage incremented: daily={_USAGE_STATE.daily_lookups_used}")
-    
-    # Increment job-specific counter if job_id provided
+        new_count = 0
+        try:
+            with quota_lock("exclusive"):
+                state = _load_usage_state_unlocked()
+                if state.date_utc != today:
+                    state = UsageState(date_utc=today, daily_lookups_used=0)
+                state.daily_lookups_used += 1
+                new_count = state.daily_lookups_used
+                _save_usage_state_unlocked(state)
+        except QuotaLockTimeout as e:
+            logger.warning(f"Quota lock timeout incrementing usage: {e}")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to increment usage: {e}")
+            return
+
+        logger.debug(f"Usage incremented: daily={new_count}")
+
+        if new_count > 0:
+            try:
+                _record_daily_tool_usage(today, quota_delta=1)
+            except Exception as e:
+                logger.warning(f"Failed to update daily history after increment: {e}")
+
     if job_id:
         async with _JOBS_LOCK:
             job = _JOBS.get(job_id)
@@ -168,28 +210,25 @@ async def _increment_usage(job_id: Optional[str] = None) -> None:
 
 
 def _get_current_usage() -> Tuple[int, str]:
-    """Get current daily usage (count, date).
-    
-    The daily counter automatically resets at 00:00 UTC when the date changes.
+    """Return current daily usage by reading vt_usage.json from disk under flock.
+
+    Does not use a process-global cache. Handles UTC date rollover with a
+    separate exclusive-lock write when the on-disk date is stale.
     """
-    global _USAGE_STATE
     today = _get_utc_date_str()
-    
-    # Load state if not initialized
-    if _USAGE_STATE is None:
-        _load_usage_state()
-    
-    # Check if we need to reset for a new UTC day
-    if _USAGE_STATE and _USAGE_STATE.date_utc != today:
-        # Date has changed - reset the counter for the new UTC day
-        _USAGE_STATE = UsageState(date_utc=today, daily_lookups_used=0)
-        _save_usage_state(_USAGE_STATE)
-        logger.info(f"Daily usage counter reset for new UTC day: {today}")
-    
-    if _USAGE_STATE:
-        return _USAGE_STATE.daily_lookups_used, today
-    
-    return 0, today
+    try:
+        with quota_lock("shared"):
+            state = _load_usage_state_unlocked()
+        disk_date = _disk_usage_date()
+        if disk_date is not None and disk_date != today:
+            reset_state = UsageState(date_utc=today, daily_lookups_used=0)
+            _save_usage_state(reset_state)
+            logger.info(f"Daily usage counter reset for new UTC day: {today}")
+            return 0, today
+        return state.daily_lookups_used, today
+    except QuotaLockTimeout as e:
+        logger.warning(f"Quota lock timeout reading usage: {e}")
+        return 0, today
 
 
 class SubmitRequest(BaseModel):
