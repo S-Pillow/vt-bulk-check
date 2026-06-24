@@ -107,7 +107,7 @@ Column descriptions:
 - `type` — `domain` or `url`
 - `flagging` — malicious + suspicious engine count
 - `total_engines` — total engines that responded
-- `detection_ratio` — e.g. `2/91`
+- `detection_ratio` — e.g. `2/91` (CSV export prefixes with a tab so Excel does not auto-parse ratios like `1/91` as dates)
 - `last_scanned` — formatted as `YYYY-MM-DD HH:MM:SS UTC`
 - `status` — `OK`, `STALE`, or `ERROR`
 - `error` — error detail if the lookup failed, empty otherwise

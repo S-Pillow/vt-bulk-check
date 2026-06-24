@@ -340,6 +340,19 @@ def _format_last_scanned(ts: Optional[int]) -> Optional[str]:
     return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
 
+def _csv_detection_ratio_cell(ratio: str) -> str:
+    """
+    Spreadsheet-safe detection_ratio for CSV export.
+
+    Excel and Google Sheets auto-parse values like 1/91 or 2/91 as dates
+    (e.g. Jan-91). A leading tab forces text interpretation; the ratio still
+    displays as flagging/total in the cell.
+    """
+    if not ratio:
+        return ""
+    return f"\t{ratio}"
+
+
 def _is_stale(ts: Optional[int], threshold_days: int = 5) -> bool:
     if not ts:
         return True
@@ -1197,7 +1210,7 @@ async def export_job_csv(job_id: str):
             item_type,
             "" if error else r.get("flagging_engines", 0),
             "" if error else r.get("total_engines", 0),
-            "" if error else r.get("detection_ratio", ""),
+            "" if error else _csv_detection_ratio_cell(r.get("detection_ratio", "")),
             r.get("last_scanned_display") or "",
             status,
             error,
