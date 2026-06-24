@@ -1,0 +1,26 @@
+# VT Bulk Check API — nginx location snippet
+#
+# Paste into the forgeforward.app server block in:
+#   /etc/nginx/sites-available/forgeforward.app
+#
+# Requires dns-tool-backend.service listening on 127.0.0.1:8000.
+# See docs/deployment/nginx-vt-bulk-check-proxy-timeout.md for context.
+#
+# After editing:
+#   sudo nginx -t && sudo systemctl reload nginx
+
+location ^~ /api/vt-bulk-check/ {
+    proxy_pass         http://127.0.0.1:8000/api/vt-bulk-check/;
+    proxy_http_version 1.1;
+
+    proxy_set_header   Host             $host;
+    proxy_set_header   X-Real-IP        $remote_addr;
+    proxy_set_header   X-Forwarded-For  $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+
+    # Required: default nginx read timeout (60s) causes 504 on Refresh/Force Scan
+    # when VT API work exceeds one minute (rate limiting, multi-step scans).
+    proxy_connect_timeout 60s;
+    proxy_send_timeout    60s;
+    proxy_read_timeout    300s;
+}

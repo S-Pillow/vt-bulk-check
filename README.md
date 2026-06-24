@@ -42,6 +42,8 @@ docs/deployment/
     batch-4c-ui-clarity.md           — UI label and UX improvements
     batch-5-latest-job-recovery.md   — latest completed job snapshot
     batch-6-usage-history.md         — daily history + per-job JSONL
+    nginx-vt-bulk-check-proxy-timeout.md — nginx 504 fix (Refresh/Force Scan)
+    nginx/                           — sanitized nginx location snippets
     systemd/                         — sanitized service and override templates
 ```
 
@@ -348,6 +350,20 @@ See `docs/deployment/` for batch-by-batch implementation records and sanitized s
 6. Confirm the backend is still bound to `127.0.0.1:8000` only.
 7. Copy frontend `dist/` contents to `/var/www/html/tools/vt-bulk-check/`.
 8. When using `cp -r` for frontend deploys, old hashed asset files accumulate. Use `rsync --delete` or clear the `assets/` subdirectory before copying to keep the directory clean.
+
+### nginx (VT Bulk Check API)
+
+The production `location ^~ /api/vt-bulk-check/` block **must** set
+`proxy_read_timeout 300s`. Without it, nginx defaults to 60s and returns **504
+Gateway Time-out** on Refresh/Force Scan while the backend may still complete the
+VT work. See [`docs/deployment/nginx-vt-bulk-check-proxy-timeout.md`](docs/deployment/nginx-vt-bulk-check-proxy-timeout.md)
+and the snippet in [`docs/deployment/nginx/forgeforward-vt-bulk-check-api.conf.example`](docs/deployment/nginx/forgeforward-vt-bulk-check-api.conf.example).
+
+After any nginx restore or new host setup:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
 
 ### Key deployment rules
 
